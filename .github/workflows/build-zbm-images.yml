@@ -46,6 +46,26 @@ jobs:
       # https://github.com/zbm-dev/zfsbootmenu/pkgs/container/zbm-builder
       image: ghcr.io/zbm-dev/zbm-builder:20260101
     steps:
+      - name: Check out ZFSBootMenu source
+        # The zbm-builder image does NOT bake in a copy of the generator
+        # at /zbm by default (confirmed the hard way: "open
+        # /zbm/etc/zbm-builder/config.yaml: no such file or directory" on
+        # the first real run of this job) - upstream's own build.yml
+        # populates /zbm itself, from its own checkout, via the symlink
+        # in the next step. Mirroring that exactly here.
+        uses: actions/checkout@v4
+        with:
+          repository: zbm-dev/zfsbootmenu
+          ref: ${{ env.ZFSBOOTMENU_REF }}
+          path: zfsbootmenu
+
+      - name: Point /zbm at the checkout
+        run: |
+          set -e
+          mkdir -p /build
+          rm -rf /zbm
+          ln -s "$(pwd)/zfsbootmenu" /zbm
+
       - name: Write the console/zfs-module fix
         # Empirically found and confirmed working in a prior, separate
         # effort to get ZFSBootMenu booting on ARM64 KVM VMs - it applies
