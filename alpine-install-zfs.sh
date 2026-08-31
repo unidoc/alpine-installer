@@ -188,7 +188,14 @@ cleanup() {
         fi
     done
 
-    if zpool list -H -o name 2>/dev/null | grep -qx "${POOL_NAME}"; then
+    # grep -c, not -q: -q closes its input as soon as it finds a match,
+    # which can SIGPIPE zpool if it's still writing - under pipefail
+    # that makes the pipeline report failure even though grep DID find
+    # the pool, so `if ... | grep -q; then` can silently take the wrong
+    # branch (confirmed this exact failure mode elsewhere in this
+    # script, see resolve_alpine_version()). grep -c always reads to
+    # EOF, so it can't trigger this.
+    if [ "$(zpool list -H -o name 2>/dev/null | grep -cx "${POOL_NAME}")" -gt 0 ]; then
         zpool export "${POOL_NAME}"
     fi
 
@@ -465,7 +472,20 @@ resolve_alpine_version() {
         if ! latest_releases="$(curl -fsSL "${ALPINE_MIRROR}/latest-stable/releases/${ARCH}/latest-releases.yaml")"; then
             die "Could not reach ${ALPINE_MIRROR} to look up Alpine's latest stable release - check network connectivity, or set ALPINE_VERSION= explicitly to skip this lookup."
         fi
-        ALPINE_VERSION="$(printf '%s\n' "${latest_releases}" | sed -n 's/^  version: //p' | head -1)"
+        # The `|| true` is load-bearing, not decoration: confirmed on a
+        # real alpine-rescue boot (BusyBox sed/head) that this pipeline
+        # can report a nonzero exit status even though ALPINE_VERSION
+        # gets the right value - `head -1` closes its input as soon as
+        # it has one line, and if sed is still writing more matches (this
+        # YAML has one "version:" line per release flavor) the resulting
+        # SIGPIPE makes sed exit nonzero, which pipefail then reports as
+        # the whole pipeline failing. Under set -e that killed the script
+        # right here with zero output, even on a fully successful lookup
+        # - the `[ -n ... ] || die` immediately below is what actually
+        # validates the result; this pipeline's own exit status isn't a
+        # meaningful signal either way once curl itself is already
+        # confirmed to have succeeded above.
+        ALPINE_VERSION="$(printf '%s\n' "${latest_releases}" | sed -n 's/^  version: //p' | head -1)" || true
         [ -n "${ALPINE_VERSION}" ] ||
             die "Could not determine Alpine's latest stable version from the fetched data. Set ALPINE_VERSION= explicitly and re-run."
     fi
@@ -524,7 +544,14 @@ partition_disk() {
         umount -R "${MOUNT_LOCATION}" || true
     fi
 
-    if zpool list -H -o name 2>/dev/null | grep -qx "${POOL_NAME}"; then
+    # grep -c, not -q: -q closes its input as soon as it finds a match,
+    # which can SIGPIPE zpool if it's still writing - under pipefail
+    # that makes the pipeline report failure even though grep DID find
+    # the pool, so `if ... | grep -q; then` can silently take the wrong
+    # branch (confirmed this exact failure mode elsewhere in this
+    # script, see resolve_alpine_version()). grep -c always reads to
+    # EOF, so it can't trigger this.
+    if [ "$(zpool list -H -o name 2>/dev/null | grep -cx "${POOL_NAME}")" -gt 0 ]; then
         zpool export "${POOL_NAME}"
     fi
 
@@ -977,7 +1004,10 @@ verify_installation() {
         die "Missing /etc/hostid."
 
     if [ "${SWAP_SIZE_GIB}" -gt 0 ]; then
-        blkid "${SWAP_PARTITION}" | grep -q 'TYPE="swap"' ||
+        # grep -c, not -q - see the comment on the zpool checks in
+        # cleanup()/partition_disk() for why -q's early-close-on-match
+        # behavior is unsafe piped from a command under pipefail.
+        [ "$(blkid "${SWAP_PARTITION}" | grep -c 'TYPE="swap"')" -gt 0 ] ||
             die "Swap partition is invalid."
     fi
 
