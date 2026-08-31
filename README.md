@@ -15,19 +15,28 @@ non-standard partition layout, or want to avoid ZFS's operational model
 
 ```sh
 wget https://raw.githubusercontent.com/unidoc/alpine-installer/master/alpine-install-zfs.sh
-PUBKEY="ssh-ed25519 AAAA... you@host" SYSDRIVE=/dev/sda sh alpine-install-zfs.sh
+PUBKEY="ssh-ed25519 AAAA... you@host" SYSDRIVE=/dev/sda bash alpine-install-zfs.sh
 ```
 
 or, for a plain (non-ZFS) install:
 
 ```sh
 wget https://raw.githubusercontent.com/unidoc/alpine-installer/master/alpine-install-normal.sh
-PUBKEY="ssh-ed25519 AAAA... you@host" SYSDRIVE=/dev/sda sh alpine-install-normal.sh
+PUBKEY="ssh-ed25519 AAAA... you@host" SYSDRIVE=/dev/sda bash alpine-install-normal.sh
 ```
 
 **These scripts destroy all data on `SYSDRIVE` without a confirmation
 prompt.** Read them before you run them against anything you care about -
 they're plain, commented bash, not a black box.
+
+**Run them with `bash`, not `sh`.** Both scripts use real bash features
+(arrays, in particular) and start with `#!/bin/bash` - on a lot of rescue
+environments (including `alpine-rescue`) `/bin/sh` is BusyBox ash, which
+ignores the shebang entirely when you invoke it as `sh script.sh` and
+fails with a confusing `syntax error: unexpected "("`. `bash` itself is
+present on `alpine-rescue` (and most rescue images) even though `/bin/sh`
+isn't it - `bash alpine-install-zfs.sh` or `chmod +x` and `./alpine-install-zfs.sh`
+both work; `sh alpine-install-zfs.sh` does not.
 
 ## Which one do I want?
 

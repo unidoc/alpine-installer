@@ -37,6 +37,20 @@
 #
 # WARNING: This script destroys all data on SYSDRIVE without confirmation.
 #
+
+# This script uses real bash features (arrays) and needs to run under
+# bash, not /bin/sh - on plenty of rescue environments (including
+# alpine-rescue) /bin/sh is BusyBox ash, which ignores the shebang above
+# entirely when invoked as `sh alpine-install-zfs.sh` and fails with a
+# confusing "syntax error: unexpected (" deep in the file instead of a
+# clear message. This check runs fine under ash BEFORE it ever reaches
+# that array syntax (verified: ash parses/executes top-to-bottom, not
+# the whole file upfront), so it's what actually surfaces here instead.
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "ERROR: This script requires bash. Run it as 'bash $0' (or 'chmod +x $0 && ./$0'), not 'sh $0'." >&2
+    exit 1
+fi
+
 set -Eeuo pipefail
 
 # ==============================================================================
@@ -189,8 +203,43 @@ partition_path() {
     esac
 }
 
+_apk_updated=0
+ensure_apk_updated() {
+    [ "${_apk_updated}" -eq 1 ] && return 0
+    apk update >/dev/null 2>&1
+    _apk_updated=1
+}
+
+# Some rescue images don't ship every tool this script needs by default
+# (gptfdisk/sgdisk in particular, seen missing on a real alpine-rescue
+# boot even though this is a ZFS-focused rescue image) - install it
+# automatically rather than making the operator do it by hand on every
+# single run. Best-effort only: if apk isn't available, there's no
+# network, or the package genuinely doesn't provide the command, the
+# command -v recheck in require_command() below still catches it and
+# dies with a clear message either way.
+apk_package_for_command() {
+    case "$1" in
+        sgdisk) echo "gptfdisk" ;;
+        mkfs.vfat) echo "dosfstools" ;;
+        zfs|zpool|zgenhostid) echo "zfs" ;;
+        *) echo "" ;;
+    esac
+}
+
 require_command() {
-    command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+    command -v "$1" >/dev/null 2>&1 && return 0
+
+    local pkg
+    pkg="$(apk_package_for_command "$1")"
+    if [ -n "${pkg}" ] && command -v apk >/dev/null 2>&1; then
+        log "Missing command: $1 - installing package '${pkg}'"
+        ensure_apk_updated
+        apk add --quiet "${pkg}" >/dev/null 2>&1 || true
+    fi
+
+    command -v "$1" >/dev/null 2>&1 ||
+        die "Missing required command: $1${pkg:+ (tried apk add ${pkg}, still missing - check network/apk repositories)}"
 }
 
 wait_for_device() {
