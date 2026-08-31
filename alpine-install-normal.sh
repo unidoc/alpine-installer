@@ -27,11 +27,20 @@
 # alpine-rescue) /bin/sh is BusyBox ash, which ignores the shebang above
 # entirely when invoked as `sh alpine-install-normal.sh` and fails with a
 # confusing "syntax error: unexpected (" deep in the file instead of a
-# clear message. This check runs fine under ash BEFORE it ever reaches
-# that array syntax (verified: ash parses/executes top-to-bottom, not
-# the whole file upfront), so it's what actually surfaces here instead.
+# clear message. Rather than just tell whoever's already fighting a
+# rescue console to go retype the command, re-exec under bash
+# automatically - this check runs fine under ash BEFORE it ever reaches
+# the array syntax further down (verified: ash parses/executes
+# top-to-bottom, not the whole file upfront), so `exec` here works
+# regardless of which shell actually launched this script. PUBKEY and
+# every other env var set as a `VAR=val command` prefix are already in
+# this process's environment by the time this line runs, and `exec`
+# preserves the environment across the re-exec - nothing gets lost.
 if [ -z "${BASH_VERSION:-}" ]; then
-    echo "ERROR: This script requires bash. Run it as 'bash $0' (or 'chmod +x $0 && ./$0'), not 'sh $0'." >&2
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$0" "$@"
+    fi
+    echo "ERROR: This script requires bash, and bash was not found on this system. Install it (e.g. apk add bash) and re-run." >&2
     exit 1
 fi
 
@@ -397,11 +406,22 @@ EOF
 resolve_alpine_version() {
     if [ -z "${ALPINE_VERSION}" ]; then
         log "Looking up Alpine's latest stable release"
-        ALPINE_VERSION="$(curl -fsSL \
-            "${ALPINE_MIRROR}/latest-stable/releases/${ARCH}/latest-releases.yaml" \
-            | sed -n 's/^  version: //p' | head -1)"
+        # curl's own failure has to be caught explicitly like this
+        # (inside an `if !`), not by assigning straight into
+        # ALPINE_VERSION and relying on the `[ -n ... ] || die` below -
+        # under `set -Eeuo pipefail`, a failing command inside a plain
+        # `var="$(cmd)"` assignment aborts the script immediately at
+        # that line (verified empirically), never reaching the "was it
+        # empty" check at all. That silently killed the whole install
+        # with no error message on a real run where the mirror was
+        # unreachable - just two log lines, then back to the prompt.
+        local latest_releases
+        if ! latest_releases="$(curl -fsSL "${ALPINE_MIRROR}/latest-stable/releases/${ARCH}/latest-releases.yaml")"; then
+            die "Could not reach ${ALPINE_MIRROR} to look up Alpine's latest stable release - check network connectivity, or set ALPINE_VERSION= explicitly to skip this lookup."
+        fi
+        ALPINE_VERSION="$(printf '%s\n' "${latest_releases}" | sed -n 's/^  version: //p' | head -1)"
         [ -n "${ALPINE_VERSION}" ] ||
-            die "Could not determine Alpine's latest stable version. Set ALPINE_VERSION= explicitly and re-run."
+            die "Could not determine Alpine's latest stable version from the fetched data. Set ALPINE_VERSION= explicitly and re-run."
     fi
     ALPINE_BRANCH="v$(printf '%s' "${ALPINE_VERSION}" | cut -d. -f1,2)"
 
