@@ -292,7 +292,7 @@ looks_like_pubkey() {
 # fatal: that means either a corrupted download or a compromised
 # artifact, and this file is about to become the system's bootloader.
 verify_zbm_checksum() {
-    local file="$1" name="$2" sums_file
+    local file="$1" name="$2" sums_file expected_hash actual_hash
     sums_file="$(mktemp)"
 
     if ! curl --fail --silent --location --output "${sums_file}" "${ZBM_CHECKSUMS_URL}" 2>/dev/null; then
@@ -301,15 +301,28 @@ verify_zbm_checksum() {
         return 0
     fi
 
-    if ! grep -q "  ${name}\$" "${sums_file}"; then
+    # Comparing hashes directly, not `sha256sum -c` against the sums
+    # file - `sha256sum -c` matches by the FILENAME recorded in the sums
+    # file (the original release asset name, e.g. zfsbootmenu-x86_64.EFI),
+    # but the file actually saved on disk here is renamed to whatever
+    # ZFSBootMenu/GRUB expect (VMLINUZ.EFI, vmlinuz-bootmenu, ...) -
+    # `sha256sum -c` would look for a file by the wrong name in the
+    # current directory and always report "No such file or directory",
+    # failing verification on every single install regardless of whether
+    # the content is actually correct. Confirmed this exact failure on a
+    # real run - VMLINUZ.EFI downloaded fine, then die() fired here on
+    # every install using the default URLs.
+    expected_hash="$(grep "  ${name}\$" "${sums_file}" | awk '{print $1}')"
+    if [ -z "${expected_hash}" ]; then
         log "No checksum entry for ${name} in SHA256SUMS - skipping verification"
         rm -f "${sums_file}"
         return 0
     fi
-
-    (cd "$(dirname "${file}")" && grep "  ${name}\$" "${sums_file}" | sha256sum -c -) ||
-        die "Checksum mismatch for ${name} - the downloaded ZFSBootMenu artifact does not match what this repo published. Refusing to install a boot image that doesn't match its own checksum."
     rm -f "${sums_file}"
+
+    actual_hash="$(sha256sum "${file}" | awk '{print $1}')"
+    [ "${expected_hash}" = "${actual_hash}" ] ||
+        die "Checksum mismatch for ${name} - the downloaded ZFSBootMenu artifact does not match what this repo published. Refusing to install a boot image that doesn't match its own checksum."
 }
 
 # Best-effort, not authoritative - covers the common cases (KVM/Xen-HVM/
