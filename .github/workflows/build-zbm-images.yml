@@ -28,9 +28,16 @@ name: Build ZFSBootMenu images
 # DKMS/gcc compile of the OpenZFS kernel module under QEMU user-mode
 # emulation. A native arm64 runner sidesteps that entirely.
 on:
+  # Manual only, deliberately - no schedule. These images get baked
+  # directly into installed systems' boot process with no PR/review gate
+  # in between (unlike the apk packages in unidoc-aports, which always
+  # go through a reviewed PR before anything changes what gets served).
+  # An automatic rebuild would silently change what
+  # .../releases/latest/download/... resolves to for anyone installing
+  # afterward, with no one having decided that should happen. Trigger
+  # this by hand when there's an actual reason to (a ZFSBOOTMENU_REF
+  # bump, a fix to the dracut/config setup, etc.), never on a timer.
   workflow_dispatch: {}
-  schedule:
-    - cron: "0 7 * * 1" # weekly
 
 env:
   # Pinned to a real upstream tag, not a moving branch - reproducible

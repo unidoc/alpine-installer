@@ -121,8 +121,12 @@ and hand the script the device path" already works.
 them ourselves - one EFI image per arch (not split by console type), plus
 the BIOS Components pair - and publish them as
 [GitHub Releases](https://github.com/unidoc/alpine-installer/releases) on
-this repo (`.github/workflows/build-zbm-images.yml`, runs weekly and on
-manual dispatch). Not GitHub Pages, not `unidoc-aports` (these are boot
+this repo (`.github/workflows/build-zbm-images.yml`, manual dispatch
+only - deliberately no schedule, since these get baked directly into
+installed systems' boot process with no PR/review gate in between; an
+automatic rebuild would silently change what
+`releases/latest/download/...` resolves to for anyone installing
+afterward). Not GitHub Pages, not `unidoc-aports` (these are boot
 binaries, not Alpine packages, a genuinely different artifact shape).
 Every case below has a working default out of the box - no override
 needed:
