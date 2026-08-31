@@ -1,0 +1,230 @@
+name: Build ZFSBootMenu images
+
+# Builds the ZFSBootMenu boot-image variants alpine-install-zfs.sh needs
+# that have no official pre-built download (see that script's
+# select_zbm_artifacts() and this repo's README "ZFSBootMenu artifacts"
+# section): a serial-console x86_64 EFI executable, an x86_64 Components
+# pair (separate kernel+initramfs for legacy BIOS/GRUB chainloading), and
+# an aarch64 EFI executable. Published as GitHub Release assets - not
+# GitHub Pages, not an apk repo, just raw files. This does NOT belong in
+# unidoc-aports: these aren't Alpine packages, they're boot binaries, a
+# completely different artifact shape.
+#
+# The x86_64 job mirrors zbm-dev/zfsbootmenu's own official release
+# build (.github/workflows/build.yml in their repo) - same pre-built
+# builder container, same build-init.sh entrypoint - just with our own
+# config.yaml/dracut fragment instead of theirs.
+#
+# aarch64 has no pre-built builder container (ghcr.io/zbm-dev/zbm-builder
+# is amd64-only - confirmed by inspecting its image manifest) and no
+# aarch64 path in upstream's own CI at all. This job instead builds the
+# zbm-builder image itself, from source, NATIVELY on a real arm64
+# GitHub-hosted runner (ubuntu-24.04-arm) - no QEMU cross-compilation.
+# That distinction matters: this exact build was already done once
+# before (a private, resolved effort - see the "console/zfs-module fix"
+# comment below), and cross-building the builder image via
+# `docker buildx --platform linux/arm64` on amd64 hardware turned out to
+# be impractically slow, because Void's zfs package triggers a real
+# DKMS/gcc compile of the OpenZFS kernel module under QEMU user-mode
+# emulation. A native arm64 runner sidesteps that entirely.
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 7 * * 1" # weekly
+
+env:
+  # Pinned to a real upstream tag, not a moving branch - reproducible
+  # builds, bumped deliberately. https://github.com/zbm-dev/zfsbootmenu/tags
+  ZFSBOOTMENU_REF: v3.1.0
+
+jobs:
+  build-x86_64:
+    runs-on: ubuntu-latest
+    container:
+      # Pinned to a dated tag, not :latest/:development - reproducible,
+      # bumped deliberately. Tag list:
+      # https://github.com/zbm-dev/zfsbootmenu/pkgs/container/zbm-builder
+      image: ghcr.io/zbm-dev/zbm-builder:20260101
+    steps:
+      - name: Write the console/zfs-module fix
+        # Empirically found and confirmed working in a prior, separate
+        # effort to get ZFSBootMenu booting on ARM64 KVM VMs - it applies
+        # here too, unchanged, because it has nothing to do with arch:
+        # it's about booting via EFI on a KVM/virtio_gpu virtual machine,
+        # which x86_64 cloud/VPS targets hit exactly the same way.
+        #
+        # Two real, separate bugs this fixes:
+        #  1. Upstream's own etc/zfsbootmenu/dracut.conf.d/omit-drivers.conf
+        #     blanket-omits "drm" (rationale: real GPU hardware doesn't
+        #     reinit after kexec) - but this build boots ZBM directly via
+        #     EFI, no kexec involved, and virtio_gpu (KVM's virtual GPU)
+        #     needs the shared drm core to bring up a console at all.
+        #     Omitting it is a black screen, not a missing feature.
+        #     Overwriting (not +=) omit_drivers here is deliberate:
+        #     dracut.conf.d files source in filename order, and a later
+        #     += can only append to an earlier file's list, never remove
+        #     from it - the file below is named to sort last.
+        #  2. ZFSBootMenu's own dracut module (module-setup.sh
+        #     installkernel()) calls `instmods -c "$mod"` for zfs/spl/etc
+        #     as its "essential modules" check - in a generic
+        #     (non-hostonly) build, which is what every container-based
+        #     build here is, that check does not actually copy the .ko
+        #     files into the image. No build error, just a ZFSBootMenu
+        #     that can never import a pool. force_drivers works around it.
+        run: |
+          set -e
+          mkdir -p /build/dracut.conf.d
+          cat > /build/dracut.conf.d/zz-console-and-zfs-fix.conf <<'EOF'
+          omit_drivers="amdgpu radeon nvidia nouveau i915"
+          force_drivers+=" virtio_gpu zfs spl icp zcommon znvpair zavl zunicode zlua "
+          EOF
+
+      - name: Build EFI (UEFI)
+        # One image for both VGA and serial, not two - the kernel command
+        # line accepts multiple console= entries and outputs boot
+        # messages to all of them; whichever is listed LAST becomes
+        # /dev/console (what ZBM's interactive menu itself attaches to).
+        # Serial is listed last here since most of what this repo
+        # targets is headless cloud/VPS boxes. Untested claim: whether
+        # ZBM's interactive TUI genuinely works on the non-primary
+        # console too, or only ever on /dev/console - not confirmed
+        # either way in ZFSBootMenu's own docs. Low-stakes to find out:
+        # if the non-primary side turns out unusable in practice, split
+        # this back into two builds (see git history for the last
+        # two-image version) - a PR, not a rewrite.
+        run: |
+          set -e
+          yq-go e '
+            .EFI.Enabled = true |
+            .EFI.Versions = false |
+            .Components.Enabled = false |
+            .Kernel.CommandLine = "zfsbootmenu ro quiet loglevel=4 console=tty0 console=ttyS0,115200n8"
+          ' /zbm/etc/zbm-builder/config.yaml > /build/config.yaml
+          cp /zbm/etc/zfsbootmenu/release.conf.d/*.conf /build/dracut.conf.d/
+          /zbm/releng/docker/build-init.sh -- --debug
+          mkdir -p /out
+          ls -la /build/build/
+          cp /build/build/*.EFI /out/zfsbootmenu-x86_64.EFI
+
+      - name: Build Components pair (legacy BIOS/GRUB chainload)
+        run: |
+          set -e
+          rm -rf /build/build /build/dracut.conf.d
+          mkdir -p /build/dracut.conf.d
+          cat > /build/dracut.conf.d/zz-console-and-zfs-fix.conf <<'EOF'
+          omit_drivers="amdgpu radeon nvidia nouveau i915"
+          force_drivers+=" virtio_gpu zfs spl icp zcommon znvpair zavl zunicode zlua "
+          EOF
+          yq-go e '
+            .EFI.Enabled = false |
+            .Components.Enabled = true |
+            .Components.Versions = false |
+            .Kernel.CommandLine = "zfsbootmenu ro quiet loglevel=4 console=tty0"
+          ' /zbm/etc/zbm-builder/config.yaml > /build/config.yaml
+          cp /zbm/etc/zfsbootmenu/release.conf.d/*.conf /build/dracut.conf.d/
+          /zbm/releng/docker/build-init.sh -- --debug
+          ls -la /build/build/
+          # Upstream's own build.yml doesn't name these explicitly either
+          # (it just globs "everything that isn't *.EFI"), so pick out
+          # the kernel and initramfs by the substring every such file
+          # has (vmlinu*/initr*) and ship them under fixed names -
+          # alpine-install-zfs.sh's defaults point at these. Also keep
+          # copies under their original names as a fallback in case this
+          # guess is wrong for some future ZFSBootMenu version; check
+          # this step's "ls -la" output above if the install script ever
+          # reports a 404 fetching these.
+          kernel_file="$(find /build/build -type f ! -name '*.EFI' -iname '*vmlinu*' | head -1)"
+          initramfs_file="$(find /build/build -type f ! -name '*.EFI' -iname '*initr*' | head -1)"
+          [ -n "${kernel_file}" ] && cp "${kernel_file}" /out/zfsbootmenu-vmlinuz
+          [ -n "${initramfs_file}" ] && cp "${initramfs_file}" /out/zfsbootmenu-initramfs.img
+          find /build/build -type f ! -name '*.EFI' -exec cp {} /out/ \;
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zbm-images-x86_64
+          path: /out/*
+          if-no-files-found: error
+
+  build-aarch64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Check out ZFSBootMenu source
+        uses: actions/checkout@v4
+        with:
+          repository: zbm-dev/zfsbootmenu
+          ref: ${{ env.ZFSBOOTMENU_REF }}
+          path: zfsbootmenu
+
+      - name: Write the console/zfs-module fix
+        # Same fix as the x86_64 job - see its comment for the full
+        # explanation. Applied to the checked-out source tree here
+        # instead of a bind-mounted /build, since this job builds the
+        # builder image itself from this checkout rather than consuming
+        # a pre-built one.
+        run: |
+          set -e
+          cat > zfsbootmenu/etc/zfsbootmenu/dracut.conf.d/zz-console-and-zfs-fix.conf <<'EOF'
+          omit_drivers="amdgpu radeon nvidia nouveau i915"
+          force_drivers+=" virtio_gpu zfs spl icp zcommon znvpair zavl zunicode zlua "
+          EOF
+
+      - name: Build the zbm-builder image natively for arm64
+        # Build context MUST be releng/docker/, not the repo root - the
+        # Dockerfile's own COPY build-init.sh fails otherwise (learned
+        # the hard way in the prior effort this workflow is based on).
+        run: docker build -t zbm-builder:local zfsbootmenu/releng/docker/
+
+      - name: Build EFI (UEFI only - no legacy-BIOS equivalent on aarch64)
+        # One image for both VGA and serial (ttyAMA0), same reasoning as
+        # the x86_64 job's EFI build - see its comment.
+        run: |
+          set -e
+          mkdir -p build/dracut.conf.d out
+          cp zfsbootmenu/etc/zfsbootmenu/dracut.conf.d/zz-console-and-zfs-fix.conf build/dracut.conf.d/
+          docker run --rm \
+            -v "$PWD/zfsbootmenu:/zbm" -v "$PWD/build:/build" \
+            zbm-builder:local sh -c '
+              set -e
+              yq-go e "
+                .EFI.Enabled = true |
+                .EFI.Versions = false |
+                .Components.Enabled = false |
+                .Kernel.CommandLine = \"zfsbootmenu ro quiet loglevel=4 console=tty0 console=ttyAMA0,115200n8\"
+              " /zbm/etc/zbm-builder/config.yaml > /build/config.yaml
+              cp /zbm/etc/zfsbootmenu/release.conf.d/*.conf /build/dracut.conf.d/
+              /zbm/releng/docker/build-init.sh -- --debug
+            '
+          sudo chown -R "$(id -u):$(id -g)" build
+          ls -la build/build/
+          cp build/build/*.EFI out/zfsbootmenu-aarch64.EFI
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zbm-images-aarch64
+          path: out/*
+          if-no-files-found: error
+
+  publish:
+    needs: [build-x86_64, build-aarch64]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          pattern: zbm-images-*
+          merge-multiple: true
+
+      - name: Publish as a GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          tag="zbm-$(date -u +%Y%m%d)"
+          gh release create "$tag" out/* \
+            --repo "${{ github.repository }}" \
+            --title "ZFSBootMenu images ($tag)" \
+            --notes "Custom-built ZFSBootMenu images (x86_64 serial-console EFI, x86_64 BIOS Components pair, aarch64 EFI) - not official ZFSBootMenu releases, built by this repo's own CI with a console/zfs-module fix on top of upstream. Consumed by alpine-install-zfs.sh's ZBM_EFI_URL/ZBM_VMLINUZ_URL/ZBM_INITRAMFS_URL." \
+            --latest

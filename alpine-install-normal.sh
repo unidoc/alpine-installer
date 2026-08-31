@@ -1,0 +1,779 @@
+#!/bin/bash
+#
+# Install Alpine Linux with GRUB and a plain (non-ZFS) root from a rescue
+# system - alpine-install-zfs.sh (this repo) is the ZFS counterpart, kept
+# as a separate script rather than merged: ZFS gets one opinionated
+# layout, this one is meant to flex.
+#
+# Target:
+#   - x86_64 or aarch64
+#   - BIOS (msdos) or UEFI (GPT)
+#   - single disk
+#   - Alpine Linux, latest stable by default (see ALPINE_VERSION below)
+#   - linux-virt or linux-lts (see VIRT below)
+#   - ext4 root, optionally on top of LVM (USE_LVM)
+#
+# Disk layout (each row optional per config, in this order):
+#   [EFI System Partition, 256 MiB - only if USE_UEFI=yes]
+#   [swap, SWAP_SIZE_GIB - only if SWAP_SIZE_GIB > 0, default 0/off]
+#   root - remaining space (a plain partition, or an LVM PV -> vg0/root
+#          if USE_LVM=yes)
+#
+# WARNING: This script destroys all data on SYSDRIVE without confirmation.
+#
+set -Eeuo pipefail
+
+# ==============================================================================
+# Configuration
+# ==============================================================================
+
+# Required configuration.
+PUBKEY="${PUBKEY:-}"
+SYSDRIVE="${SYSDRIVE:-/dev/sda}"
+ARCH="$(uname -m)"
+
+# Optional configuration.
+SYSHOSTNAME="${SYSHOSTNAME:-alpine}"
+ALPINE_BRANCH=""
+# Leave empty to auto-detect Alpine's own current latest-stable release at
+# run time (see resolve_alpine_version()) - set it explicitly to pin a
+# specific release instead.
+ALPINE_VERSION="${ALPINE_VERSION:-}"
+USE_SERIAL="${USE_SERIAL:-no}"
+USE_UEFI="${USE_UEFI:-auto}"
+
+# "auto" (default) guesses from a CPUID hypervisor flag / ARM hypervisor
+# device-tree node / DMI vendor strings - see detect_virt() below. It's a
+# heuristic, not a certainty - force "yes" or "no" if you already know
+# which one you want. "yes" installs linux-virt (smaller, faster kernel,
+# no real-hardware driver bloat); "no" installs linux-lts (real disk/GPU/
+# NIC drivers, for bare metal).
+VIRT="${VIRT:-auto}"
+KERNEL_FLAVOR=""
+KERNEL_PACKAGE=""
+
+MOUNT_LOCATION="/mnt/alpine"
+
+# 0 disables swap entirely (default - most cloud/VM hosts already provide
+# swap another way, or the operator wants none). Set to a positive whole
+# number of GiB to carve out a dedicated swap partition instead.
+SWAP_SIZE_GIB="${SWAP_SIZE_GIB:-0}"
+
+# "yes" puts root on an LVM logical volume (vg0/root, one PV, one LV
+# spanning the whole VG) instead of directly on the raw partition. This
+# is intentionally the one bit of "flexibility" this script offers beyond
+# swap on/off - if you want a genuinely custom multi-LV or multi-PV
+# layout, partition and pvcreate/vgcreate/lvcreate yourself first, then
+# point ROOT_PARTITION at the resulting /dev/vgX/lvY before running this
+# (set SKIP_PARTITIONING=yes to have this script leave the disk alone).
+USE_LVM="${USE_LVM:-no}"
+LVM_VG_NAME="${LVM_VG_NAME:-vg0}"
+LVM_LV_NAME="${LVM_LV_NAME:-root}"
+
+# "yes" skips partition_disk() entirely and uses EFI_PARTITION/
+# ROOT_PARTITION (or, with USE_LVM=yes, VG_PARTITION) exactly as given -
+# for operators who already partitioned the disk their own way and just
+# want the rest of the install (rootfs, packages, bootloader, ZFS-less
+# credentials model) done for them.
+SKIP_PARTITIONING="${SKIP_PARTITIONING:-no}"
+
+ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
+
+# Populated by resolve_alpine_version() / partition_disk() as the install
+# proceeds. Pre-set EFI_PARTITION/ROOT_PARTITION yourself when
+# SKIP_PARTITIONING=yes.
+ROOTFS_FILE=""
+ROOTFS_URL=""
+ROOTFS_SHA256_URL=""
+EFI_PARTITION="${EFI_PARTITION:-}"
+SWAP_PARTITION="${SWAP_PARTITION:-}"
+ROOT_PARTITION="${ROOT_PARTITION:-}"
+EFI_FALLBACK_NAME=""
+WORKDIR=""
+efi_uuid=""
+swap_uuid=""
+root_uuid=""
+
+# ==============================================================================
+# Helpers
+# ==============================================================================
+
+log() {
+    printf '\n==> %s\n' "$*"
+}
+
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    set +e
+
+    for path in boot/efi run dev proc sys; do
+        if mountpoint -q "${MOUNT_LOCATION}/${path}" 2>/dev/null; then
+            umount -l "${MOUNT_LOCATION}/${path}"
+        fi
+    done
+
+    if mountpoint -q "${MOUNT_LOCATION}" 2>/dev/null; then
+        umount "${MOUNT_LOCATION}"
+    fi
+
+    if [ -n "${WORKDIR}" ] && [ -d "${WORKDIR}" ]; then
+        rm -rf "${WORKDIR}"
+    fi
+}
+trap cleanup EXIT
+
+partition_path() {
+    local disk="$1"
+    local number="$2"
+
+    case "${disk}" in
+        *[0-9])
+            printf '%sp%s\n' "${disk}" "${number}"
+            ;;
+        *)
+            printf '%s%s\n' "${disk}" "${number}"
+            ;;
+    esac
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+wait_for_device() {
+    local device="$1"
+    local attempt
+
+    for attempt in $(seq 1 20); do
+        [ -b "${device}" ] && return 0
+        sleep 1
+    done
+
+    die "Device did not appear: ${device}"
+}
+
+looks_like_pubkey() {
+    case "$1" in
+        ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-*\ *|sk-ecdsa-sha2-*\ *|sk-ssh-ed25519\ *)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Best-effort, not authoritative - covers the common cases (KVM/Xen-HVM/
+# VMware/VirtualBox/Hyper-V on x86, QEMU's ARM "virt" machine, most cloud
+# DMI vendor strings on either arch) without needing any extra package.
+detect_virt() {
+    if [ -r /proc/cpuinfo ] && grep -qw hypervisor /proc/cpuinfo 2>/dev/null; then
+        return 0
+    fi
+    if [ -e /proc/device-tree/hypervisor/compatible ]; then
+        return 0
+    fi
+    local dmi_file
+    for dmi_file in /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name; do
+        if [ -r "${dmi_file}" ]; then
+            case "$(cat "${dmi_file}" 2>/dev/null)" in
+                *QEMU*|*KVM*|*VirtualBox*|*VMware*|*Xen*|*"Microsoft Corporation"*|*"Google Compute Engine"*|*"Amazon EC2"*|*Bochs*|*OpenStack*|*DigitalOcean*|*innotek*)
+                    return 0
+                    ;;
+            esac
+        fi
+    done
+    return 1
+}
+
+# ==============================================================================
+# Install phases
+# ==============================================================================
+
+validate_environment() {
+    [ "$(id -u)" -eq 0 ] || die "Run this script as root."
+
+    if [ -z "${PUBKEY}" ]; then
+        die "PUBKEY is not set. Export PUBKEY=\"ssh-ed25519 AAAA... you@host\" (one or more newline-separated key lines) and re-run. There is no default key - this installer refuses to run without one."
+    fi
+    local key_line
+    while IFS= read -r key_line; do
+        [ -z "${key_line}" ] && continue
+        looks_like_pubkey "${key_line}" ||
+            die "PUBKEY does not look like an SSH public key line: '${key_line}'. Expected something starting with ssh-ed25519, ssh-rsa, ecdsa-sha2-*, or sk-*."
+    done <<EOF
+${PUBKEY}
+EOF
+
+    [ -n "${SYSHOSTNAME}" ] || die "SYSHOSTNAME is empty."
+    [ -b "${SYSDRIVE}" ] || die "SYSDRIVE is not a block device: ${SYSDRIVE}"
+
+    case "${ARCH}" in
+        x86_64)
+            EFI_FALLBACK_NAME="BOOTX64.EFI"
+            ;;
+        aarch64)
+            EFI_FALLBACK_NAME="BOOTAA64.EFI"
+            ;;
+        *)
+            die "Unsupported ARCH: ${ARCH}. Supported values: x86_64 and aarch64."
+            ;;
+    esac
+
+    case "${USE_UEFI}" in
+        auto)
+            if [ -d /sys/firmware/efi ]; then
+                USE_UEFI="yes"
+            else
+                USE_UEFI="no"
+            fi
+            ;;
+        yes|no)
+            ;;
+        *)
+            die "Unsupported USE_UEFI: ${USE_UEFI}. Supported values: auto, yes, and no."
+            ;;
+    esac
+    if [ "${ARCH}" = "aarch64" ] && [ "${USE_UEFI}" = "no" ]; then
+        die "aarch64 has no legacy BIOS boot path; USE_UEFI=no is only valid for x86_64."
+    fi
+    if [ "${USE_UEFI}" = "yes" ]; then
+        [ -d /sys/firmware/efi ] ||
+            die "USE_UEFI=yes but the rescue system was not booted in UEFI mode."
+    fi
+
+    case "${SWAP_SIZE_GIB}" in
+        ''|*[!0-9]*)
+            die "SWAP_SIZE_GIB must be a non-negative integer, got: ${SWAP_SIZE_GIB}"
+            ;;
+    esac
+
+    case "${VIRT}" in
+        auto)
+            if detect_virt; then
+                VIRT="yes"
+            else
+                VIRT="no"
+            fi
+            log "VIRT=auto detected VIRT=${VIRT}"
+            ;;
+        yes|no)
+            ;;
+        *)
+            die "Unsupported VIRT: ${VIRT}. Supported values: auto, yes, and no."
+            ;;
+    esac
+    case "${VIRT}" in
+        yes) KERNEL_FLAVOR="virt" ;;
+        no) KERNEL_FLAVOR="lts" ;;
+    esac
+    KERNEL_PACKAGE="linux-${KERNEL_FLAVOR}"
+
+    case "${USE_LVM}" in
+        yes|no) ;;
+        *) die "Unsupported USE_LVM: ${USE_LVM}. Supported values: yes and no." ;;
+    esac
+
+    case "${SKIP_PARTITIONING}" in
+        yes)
+            [ -b "${ROOT_PARTITION}" ] ||
+                die "SKIP_PARTITIONING=yes requires ROOT_PARTITION to already point at an existing block device (partition or LV)."
+            if [ "${USE_UEFI}" = "yes" ]; then
+                [ -b "${EFI_PARTITION}" ] ||
+                    die "SKIP_PARTITIONING=yes with USE_UEFI=yes requires EFI_PARTITION to already point at an existing block device."
+            fi
+            if [ "${SWAP_SIZE_GIB}" -gt 0 ]; then
+                [ -b "${SWAP_PARTITION}" ] ||
+                    die "SKIP_PARTITIONING=yes with SWAP_SIZE_GIB>0 requires SWAP_PARTITION to already point at an existing block device."
+            fi
+            ;;
+        no) ;;
+        *) die "Unsupported SKIP_PARTITIONING: ${SKIP_PARTITIONING}. Supported values: yes and no." ;;
+    esac
+
+    [ "$(uname -m)" = "${ARCH}" ] || die "ARCH=${ARCH} does not match rescue architecture $(uname -m)."
+
+    local -a required_commands=(
+        awk blkid chroot curl getent grep install mkfs.ext4 mkfs.vfat
+        mktemp mount mountpoint parted partprobe sed sha256sum tar umount
+        wipefs
+    )
+    if [ "${USE_LVM}" = "yes" ]; then
+        required_commands+=(pvcreate vgcreate lvcreate)
+    fi
+    if [ "${SKIP_PARTITIONING}" = "no" ]; then
+        :
+    fi
+    for command in "${required_commands[@]}"; do
+        require_command "${command}"
+    done
+
+    getent hosts dl-cdn.alpinelinux.org >/dev/null 2>&1 ||
+        die "Unable to resolve dl-cdn.alpinelinux.org."
+}
+
+# Sets ALPINE_BRANCH/ALPINE_VERSION (if not already pinned) and the
+# rootfs download URLs derived from them.
+resolve_alpine_version() {
+    if [ -z "${ALPINE_VERSION}" ]; then
+        log "Looking up Alpine's latest stable release"
+        ALPINE_VERSION="$(curl -fsSL \
+            "${ALPINE_MIRROR}/latest-stable/releases/${ARCH}/latest-releases.yaml" \
+            | sed -n 's/^  version: //p' | head -1)"
+        [ -n "${ALPINE_VERSION}" ] ||
+            die "Could not determine Alpine's latest stable version. Set ALPINE_VERSION= explicitly and re-run."
+    fi
+    ALPINE_BRANCH="v$(printf '%s' "${ALPINE_VERSION}" | cut -d. -f1,2)"
+
+    ROOTFS_FILE="alpine-minirootfs-${ALPINE_VERSION}-${ARCH}.tar.gz"
+    ROOTFS_URL="${ALPINE_MIRROR}/${ALPINE_BRANCH}/releases/${ARCH}/${ROOTFS_FILE}"
+    ROOTFS_SHA256_URL="${ROOTFS_URL}.sha256"
+}
+
+partition_disk() {
+    if [ "${SKIP_PARTITIONING}" = "yes" ]; then
+        log "SKIP_PARTITIONING=yes - using pre-existing partitions as given"
+        lsblk "${SYSDRIVE}"
+        return 0
+    fi
+
+    log "Installation target"
+    lsblk "${SYSDRIVE}"
+    log "Destroying all data on ${SYSDRIVE}"
+
+    mkdir -p "${MOUNT_LOCATION}"
+
+    if mountpoint -q "${MOUNT_LOCATION}" 2>/dev/null; then
+        umount -R "${MOUNT_LOCATION}" || true
+    fi
+
+    wipefs -a "${SYSDRIVE}"
+
+    # Build the partition list in disk order: [efi] [swap] root - each
+    # optional per config except root. Ends are cumulative MiB offsets;
+    # "-1" means "rest of the disk" (parted's own convention).
+    local -a part_names=() part_ends=() part_flags=()
+    local offset=1
+
+    if [ "${USE_UEFI}" = "yes" ]; then
+        offset=$((offset + 256))
+        part_names+=("efi"); part_ends+=("${offset}"); part_flags+=("esp")
+    fi
+    if [ "${SWAP_SIZE_GIB}" -gt 0 ]; then
+        offset=$((offset + SWAP_SIZE_GIB * 1024))
+        part_names+=("swap"); part_ends+=("${offset}"); part_flags+=("")
+    fi
+    part_names+=("root"); part_ends+=("-1")
+    if [ "${USE_UEFI}" = "no" ]; then
+        part_flags+=("boot")
+    else
+        part_flags+=("")
+    fi
+
+    log "Creating partitions"
+    local -a parted_args=(-s -a optimal "${SYSDRIVE}" unit mib)
+    if [ "${USE_UEFI}" = "yes" ]; then
+        parted_args+=(mklabel gpt)
+    else
+        parted_args+=(mklabel msdos)
+    fi
+
+    local i=0 start=1 fstype
+    while [ "${i}" -lt "${#part_names[@]}" ]; do
+        case "${part_names[$i]}" in
+            efi) fstype="fat32" ;;
+            swap) fstype="linux-swap" ;;
+            root) fstype="ext4" ;;
+        esac
+        parted_args+=(mkpart primary "${fstype}" "${start}" "${part_ends[$i]}" name "$((i + 1))" "${part_names[$i]}")
+        if [ -n "${part_flags[$i]}" ]; then
+            parted_args+=(set "$((i + 1))" "${part_flags[$i]}" on)
+        fi
+        start="${part_ends[$i]}"
+        i=$((i + 1))
+    done
+
+    parted "${parted_args[@]}"
+
+    partprobe "${SYSDRIVE}" || true
+    command -v udevadm >/dev/null 2>&1 && udevadm settle || true
+    command -v mdev >/dev/null 2>&1 && mdev -s || true
+
+    i=0
+    while [ "${i}" -lt "${#part_names[@]}" ]; do
+        local dev
+        dev="$(partition_path "${SYSDRIVE}" "$((i + 1))")"
+        wait_for_device "${dev}"
+        case "${part_names[$i]}" in
+            efi) EFI_PARTITION="${dev}" ;;
+            swap) SWAP_PARTITION="${dev}" ;;
+            root) ROOT_PARTITION="${dev}" ;;
+        esac
+        i=$((i + 1))
+    done
+}
+
+setup_lvm() {
+    [ "${USE_LVM}" = "yes" ] || return 0
+
+    log "Creating LVM volume group ${LVM_VG_NAME} and logical volume ${LVM_LV_NAME}"
+    pvcreate -f "${ROOT_PARTITION}"
+    vgcreate "${LVM_VG_NAME}" "${ROOT_PARTITION}"
+    lvcreate -n "${LVM_LV_NAME}" -l 100%FREE "${LVM_VG_NAME}"
+
+    ROOT_PARTITION="/dev/${LVM_VG_NAME}/${LVM_LV_NAME}"
+    wait_for_device "${ROOT_PARTITION}"
+}
+
+format_root() {
+    log "Formatting root partition"
+    mkfs.ext4 -F "${ROOT_PARTITION}"
+    mount "${ROOT_PARTITION}" "${MOUNT_LOCATION}"
+    root_uuid="$(blkid -s UUID -o value "${ROOT_PARTITION}")"
+}
+
+create_swap() {
+    [ "${SWAP_SIZE_GIB}" -gt 0 ] || return 0
+    log "Creating swap"
+    mkswap -L swap "${SWAP_PARTITION}"
+    swap_uuid="$(blkid -s UUID -o value "${SWAP_PARTITION}")"
+}
+
+fetch_rootfs() {
+    log "Downloading Alpine ${ALPINE_VERSION} root filesystem"
+    WORKDIR="$(mktemp -d)"
+
+    curl --fail --location \
+        --output "${WORKDIR}/${ROOTFS_FILE}" \
+        "${ROOTFS_URL}"
+
+    curl --fail --location \
+        --output "${WORKDIR}/${ROOTFS_FILE}.sha256" \
+        "${ROOTFS_SHA256_URL}"
+
+    (
+        cd "${WORKDIR}"
+        sha256sum -c "${ROOTFS_FILE}.sha256"
+    )
+
+    tar -xzf "${WORKDIR}/${ROOTFS_FILE}" -C "${MOUNT_LOCATION}"
+}
+
+write_base_config() {
+    log "Preparing base configuration"
+    cat > "${MOUNT_LOCATION}/etc/resolv.conf" <<'EOF'
+nameserver 8.8.8.8
+nameserver 2001:4860:4860::8844
+EOF
+
+    printf '%s\n' "${SYSHOSTNAME}" > "${MOUNT_LOCATION}/etc/hostname"
+
+    cat > "${MOUNT_LOCATION}/etc/hosts" <<EOF
+127.0.0.1       ${SYSHOSTNAME} localhost localhost.localdomain
+::1             ${SYSHOSTNAME} localhost localhost.localdomain
+EOF
+
+    printf 'Welcome to %s\n' "${SYSHOSTNAME}" > "${MOUNT_LOCATION}/etc/motd"
+
+    install -d -m 0700 "${MOUNT_LOCATION}/root/.ssh"
+    printf '%s\n' "${PUBKEY}" > "${MOUNT_LOCATION}/root/.ssh/authorized_keys"
+    chmod 0600 "${MOUNT_LOCATION}/root/.ssh/authorized_keys"
+}
+
+write_bootloader_config() {
+    log "Preparing GRUB configuration"
+    local grub_linux_normal grub_linux_serial
+    grub_linux_normal="net.ifnames=0 modules=virtio_mmio,usbkbd,ext4 rootfstype=ext4"
+    grub_linux_serial="${grub_linux_normal} console=ttyS0,115200n8"
+
+    if [ "${ARCH}" = "aarch64" ]; then
+        # No serial console handling for aarch64 here; fall back to tty0/ttyAMA0.
+        grub_linux_normal="${grub_linux_normal} console=ttyAMA0 console=tty0"
+    fi
+
+    if [ "${USE_SERIAL}" = "yes" ]; then
+        cat > "${MOUNT_LOCATION}/root/grub.conf" <<EOF
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR=Alpine
+GRUB_CMDLINE_LINUX_DEFAULT=""
+GRUB_CMDLINE_LINUX="${grub_linux_serial}"
+GRUB_TERMINAL=serial
+GRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1"
+EOF
+    else
+        cat > "${MOUNT_LOCATION}/root/grub.conf" <<EOF
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR=Alpine
+GRUB_CMDLINE_LINUX_DEFAULT=""
+GRUB_CMDLINE_LINUX="${grub_linux_normal}"
+GRUB_TERMINAL=console
+EOF
+    fi
+
+    log "Preparing bootloader installer"
+    if [ "${USE_UEFI}" = "yes" ]; then
+        cat > "${MOUNT_LOCATION}/root/install-bootloader.sh" <<'EOF'
+#!/bin/sh
+set -eu
+apk add grub grub-efi
+grub-install --efi-directory=/boot/efi --removable
+EOF
+    else
+        cat > "${MOUNT_LOCATION}/root/install-bootloader.sh" <<EOF
+#!/bin/sh
+set -eu
+apk add grub grub-bios
+grub-install ${SYSDRIVE}
+EOF
+    fi
+    chmod 0755 "${MOUNT_LOCATION}/root/install-bootloader.sh"
+}
+
+write_fstab() {
+    cat > "${MOUNT_LOCATION}/etc/fstab" <<EOF
+UUID=${root_uuid} / ext4 defaults 0 1
+EOF
+    if [ "${SWAP_SIZE_GIB}" -gt 0 ]; then
+        printf 'UUID=%s none swap sw 0 0\n' "${swap_uuid}" >> "${MOUNT_LOCATION}/etc/fstab"
+    fi
+    cat >> "${MOUNT_LOCATION}/etc/fstab" <<'EOF'
+proc /proc proc defaults,hidepid=2 0 0
+tmpfs /tmp tmpfs defaults,nosuid,nodev 0 0
+EOF
+
+    if [ "${USE_UEFI}" = "yes" ]; then
+        log "Formatting EFI System Partition"
+        mkfs.vfat -F32 -n EFI "${EFI_PARTITION}"
+        efi_uuid="$(blkid -s UUID -o value "${EFI_PARTITION}")"
+
+        mkdir -p "${MOUNT_LOCATION}/boot/efi"
+        mount "${EFI_PARTITION}" "${MOUNT_LOCATION}/boot/efi"
+
+        printf 'UUID=%s /boot/efi vfat defaults,noauto,noatime 0 2\n' "${efi_uuid}" \
+            >> "${MOUNT_LOCATION}/etc/fstab"
+    fi
+}
+
+install_acpi_handler() {
+    log "Installing ACPI power-button handler"
+    install -d -m 0755 "${MOUNT_LOCATION}/etc/acpi/handlers"
+    install -d -m 0755 "${MOUNT_LOCATION}/etc/acpi/events"
+
+    cat > "${MOUNT_LOCATION}/etc/acpi/events/anything" <<'EOF'
+event=.*
+action=/etc/acpi/handlers/power-button.sh %e
+EOF
+
+    cat > "${MOUNT_LOCATION}/etc/acpi/handlers/power-button.sh" <<'EOF'
+#!/bin/sh
+
+PATH="/usr/share/acpid:$PATH"
+alias log='logger -t acpid'
+
+case "$1:$2:$3:$4" in
+    button/power:*)
+        log "Power button pressed - shutting down"
+        poweroff
+        ;;
+esac
+
+exit 0
+EOF
+
+    chmod 0755 "${MOUNT_LOCATION}/etc/acpi/handlers/power-button.sh"
+}
+
+mount_chroot_filesystems() {
+    log "Mounting chroot filesystems"
+    mount -t proc proc "${MOUNT_LOCATION}/proc"
+    mount -t sysfs sys "${MOUNT_LOCATION}/sys"
+    mount --rbind /dev "${MOUNT_LOCATION}/dev"
+    mount --make-rslave "${MOUNT_LOCATION}/dev"
+    mount --rbind /run "${MOUNT_LOCATION}/run"
+    mount --make-rslave "${MOUNT_LOCATION}/run"
+}
+
+write_chroot_install_script() {
+    local lvm_package="" lvm_feature=""
+    if [ "${USE_LVM}" = "yes" ]; then
+        lvm_package="lvm2"
+        lvm_feature=" lvm"
+    fi
+
+    cat > "${MOUNT_LOCATION}/chroot-install-script.sh" <<EOF
+#!/bin/sh
+set -eu
+
+apk update
+apk upgrade
+
+apk add \
+    alpine-base \
+    acpid \
+    bash \
+    chrony \
+    curl \
+    dosfstools \
+    e2fsprogs \
+    ${KERNEL_PACKAGE} \
+    ncurses-terminfo \
+    openrc \
+    openssh \
+    openssh-server \
+    shadow \
+    sudo \
+    vim \
+    wget \
+    whois \
+    ${lvm_package}
+
+echo 'LANG=en_US.UTF-8' > /etc/profile.d/locale.sh
+
+sh /root/install-bootloader.sh
+rm -f /root/install-bootloader.sh
+mv -f /root/grub.conf /etc/default/grub
+
+mkdir -p /etc/mkinitfs/features.d
+which /sbin/fsck.ext4 > /etc/mkinitfs/features.d/alpine-installer.files
+which /sbin/fsck.vfat >> /etc/mkinitfs/features.d/alpine-installer.files
+sed -i 's/^features="/features="alpine-installer${lvm_feature} /' /etc/mkinitfs/mkinitfs.conf
+
+kernel_path="\$(find /lib/modules -mindepth 1 -maxdepth 1 -type d | head -n1)"
+[ -n "\${kernel_path}" ]
+kernel_version="\$(basename "\${kernel_path}")"
+mkinitfs -c /etc/mkinitfs/mkinitfs.conf "\${kernel_version}"
+
+update-grub
+
+rc-update add devfs sysinit
+rc-update add dmesg sysinit
+rc-update add mdev sysinit
+rc-update add hwdrivers sysinit
+
+rc-update add hwclock boot
+rc-update add modules boot
+rc-update add sysctl boot
+rc-update add hostname boot
+rc-update add bootmisc boot
+rc-update add networking boot
+rc-update add acpid boot
+EOF
+    if [ "${SWAP_SIZE_GIB}" -gt 0 ]; then
+        printf 'rc-update add swap boot\n' >> "${MOUNT_LOCATION}/chroot-install-script.sh"
+    fi
+    cat >> "${MOUNT_LOCATION}/chroot-install-script.sh" <<EOF
+
+rc-update add mount-ro shutdown
+rc-update add killprocs shutdown
+rc-update add savecache shutdown
+
+rc-update add crond default
+rc-update add chronyd default
+rc-update add sshd default
+
+echo button >> /etc/modules
+
+setup-timezone UTC
+
+# Root's password is deliberately left EMPTY, not set and not locked -
+# shadow(5) is explicit that an empty password field means "no password
+# required" for whoever authenticates that way. Combined with the sshd
+# drop-in below (PermitEmptyPasswords no, which is also OpenSSH's own
+# compiled-in default - stated here so this doesn't silently depend on
+# that default never changing), that means: a real physical/KVM console
+# login prompt lets root in with no password at all (run \`passwd\` there
+# to set a real one), while sshd refuses to ever accept that same empty
+# password over the network - only the PUBKEY installed above works over
+# SSH until someone does that.
+passwd -d root
+
+mkdir -p /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/local.conf <<'SSHDEOF'
+PermitRootLogin yes
+PermitEmptyPasswords no
+PasswordAuthentication yes
+PubkeyAuthentication yes
+SSHDEOF
+
+getent passwd sshd >/dev/null || adduser -h / -s /sbin/nologin -S sshd
+
+if [ "${USE_SERIAL}" = "yes" ]; then
+    sed -i '/^[#]\\?ttyS0/s/^#//' /etc/inittab
+fi
+
+rm -f /chroot-install-script.sh
+EOF
+
+    chmod 0755 "${MOUNT_LOCATION}/chroot-install-script.sh"
+}
+
+run_chroot_install() {
+    log "Installing Alpine packages"
+    chroot "${MOUNT_LOCATION}" /bin/sh /chroot-install-script.sh
+}
+
+verify_installation() {
+    log "Validating installation"
+    test -f "${MOUNT_LOCATION}/boot/vmlinuz-${KERNEL_FLAVOR}" ||
+        die "Missing Alpine ${KERNEL_FLAVOR} kernel."
+
+    test -f "${MOUNT_LOCATION}/boot/initramfs-${KERNEL_FLAVOR}" ||
+        die "Missing Alpine initramfs."
+
+    test -f "${MOUNT_LOCATION}/boot/grub/grub.cfg" ||
+        die "Missing /boot/grub/grub.cfg; GRUB installation may have failed."
+
+    if [ "${USE_UEFI}" = "yes" ]; then
+        test -f "${MOUNT_LOCATION}/boot/efi/EFI/BOOT/${EFI_FALLBACK_NAME}" ||
+            die "Missing portable GRUB EFI executable."
+    fi
+
+    if [ "${SWAP_SIZE_GIB}" -gt 0 ]; then
+        blkid "${SWAP_PARTITION}" | grep -q 'TYPE="swap"' ||
+            die "Swap partition is invalid."
+    fi
+}
+
+print_summary() {
+    log "Installation completed successfully"
+    printf '%s\n' \
+        "Alpine ${ALPINE_VERSION} is installed on ${ROOT_PARTITION}$( [ "${USE_LVM}" = "yes" ] && printf ' (LVM: %s/%s)' "${LVM_VG_NAME}" "${LVM_LV_NAME}" )." \
+        "GRUB is installed ($( [ "${USE_UEFI}" = "yes" ] && echo UEFI || echo BIOS ))." \
+        "SSH: key-only (your PUBKEY), root has no password. Log in at the" \
+        "real console and run 'passwd' there to also enable SSH password login." \
+        "Exit the rescue environment and reboot."
+}
+
+# ==============================================================================
+# Main
+# ==============================================================================
+
+main() {
+    validate_environment
+    resolve_alpine_version
+    partition_disk
+    setup_lvm
+    format_root
+    create_swap
+    fetch_rootfs
+    write_base_config
+    write_bootloader_config
+    write_fstab
+    install_acpi_handler
+    mount_chroot_filesystems
+    write_chroot_install_script
+    run_chroot_install
+    verify_installation
+    print_summary
+
+    trap - EXIT
+    cleanup
+}
+
+main "$@"

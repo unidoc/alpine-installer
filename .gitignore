@@ -1,0 +1,4 @@
+.env
+*.iso
+*.img
+temp/
