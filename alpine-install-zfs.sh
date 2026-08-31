@@ -105,15 +105,16 @@ VIRT="${VIRT:-auto}"
 USE_UEFI="${USE_UEFI:-auto}"
 
 # Every EFI image below is built by this repo itself
-# (.github/workflows/build-zbm-images.yml) - one per arch, not split by
-# console type. The kernel command line it's built with lists both
-# console=tty0 and a serial console, so a single image covers VGA and
-# serial; ZFSBootMenu's own docs don't confirm whether the interactive
-# menu itself works on both at once (only that kernel messages go to
-# both) - untested in practice as of this writing. Low-stakes to find
-# out empirically: the *-latest-* URLs below always resolve to whichever
-# GitHub Release is currently marked latest, so a bad build just needs a
-# new release, no script change.
+# (.github/workflows/build-zbm-images.yml) - separate VGA and serial
+# images for both x86_64 and aarch64. A single combined image (both
+# console= entries baked into one kernel command line) was tried first:
+# the kernel does send boot messages to every console listed, but only
+# the LAST one becomes /dev/console, which is the only one ZFSBootMenu's
+# interactive menu actually attaches to - confirmed on a real install
+# that the non-primary console got boot log only, no menu at all. The
+# *-latest-* URLs below always resolve to whichever GitHub Release is
+# currently marked latest, so a bad build just needs a new release, no
+# script change.
 #
 # BIOS mode's separate kernel+initramfs Components pair is also built
 # and published there. Its output filenames aren't something upstream
@@ -121,8 +122,10 @@ USE_UEFI="${USE_UEFI:-auto}"
 # workflow picks them out by the vmlinu*/initr* substring every such
 # file has - if that guess is ever wrong for some future ZFSBootMenu
 # version, the fix is a one-line rename in the workflow, not here.
-ZBM_X86_64_URL="https://github.com/unidoc/alpine-installer/releases/latest/download/zfsbootmenu-x86_64.EFI"
-ZBM_AARCH64_URL="https://github.com/unidoc/alpine-installer/releases/latest/download/zfsbootmenu-aarch64.EFI"
+ZBM_VGA_X86_64_URL="https://github.com/unidoc/alpine-installer/releases/latest/download/zfsbootmenu-x86_64-vga.EFI"
+ZBM_SERIAL_X86_64_URL="https://github.com/unidoc/alpine-installer/releases/latest/download/zfsbootmenu-x86_64-serial.EFI"
+ZBM_VGA_AARCH64_URL="https://github.com/unidoc/alpine-installer/releases/latest/download/zfsbootmenu-aarch64-vga.EFI"
+ZBM_SERIAL_AARCH64_URL="https://github.com/unidoc/alpine-installer/releases/latest/download/zfsbootmenu-aarch64-serial.EFI"
 ZBM_VMLINUZ_X86_64_URL="https://github.com/unidoc/alpine-installer/releases/latest/download/zfsbootmenu-vmlinuz"
 ZBM_INITRAMFS_X86_64_URL="https://github.com/unidoc/alpine-installer/releases/latest/download/zfsbootmenu-initramfs.img"
 ZBM_EFI_URL="${ZBM_EFI_URL:-}"
@@ -525,10 +528,19 @@ select_zbm_artifacts() {
         if [ -n "${ZBM_EFI_URL}" ] || [ -n "${ZBM_EFI_FILE}" ]; then
             return 0
         fi
-        case "${ARCH}" in
-            x86_64) ZBM_EFI_URL="${ZBM_X86_64_URL}" ;;
-            aarch64) ZBM_EFI_URL="${ZBM_AARCH64_URL}" ;;
-        esac
+        if [ "${ARCH}" = "x86_64" ]; then
+            if [ "${USE_SERIAL}" = "yes" ]; then
+                ZBM_EFI_URL="${ZBM_SERIAL_X86_64_URL}"
+            else
+                ZBM_EFI_URL="${ZBM_VGA_X86_64_URL}"
+            fi
+        else
+            if [ "${USE_SERIAL}" = "yes" ]; then
+                ZBM_EFI_URL="${ZBM_SERIAL_AARCH64_URL}"
+            else
+                ZBM_EFI_URL="${ZBM_VGA_AARCH64_URL}"
+            fi
+        fi
     else
         if [ -z "${ZBM_VMLINUZ_URL}" ] && [ -z "${ZBM_VMLINUZ_FILE}" ]; then
             ZBM_VMLINUZ_URL="${ZBM_VMLINUZ_X86_64_URL}"

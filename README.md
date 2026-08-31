@@ -133,8 +133,9 @@ and hand the script the device path" already works.
 ## ZFSBootMenu artifacts
 
 `alpine-install-zfs.sh` needs a ZFSBootMenu boot image. We build all of
-them ourselves - one EFI image per arch (not split by console type), plus
-the BIOS Components pair - and publish them as
+them ourselves - separate VGA and serial EFI images for x86_64, a
+console-only EFI image for aarch64, plus the BIOS Components pair - and
+publish them as
 [GitHub Releases](https://github.com/unidoc/alpine-installer/releases) on
 this repo (`.github/workflows/build-zbm-images.yml`, manual dispatch
 only - deliberately no schedule, since these get baked directly into
@@ -148,19 +149,21 @@ needed:
 
 | Case | Default source |
 |---|---|
-| x86_64, UEFI | Built by us - one image, both VGA and serial baked into the kernel command line |
-| aarch64, UEFI | Built by us - one image, both VGA and serial baked in |
+| x86_64, UEFI, VGA (`USE_SERIAL=no`, default) | Built by us |
+| x86_64, UEFI, serial (`USE_SERIAL=yes`) | Built by us |
+| aarch64, UEFI, VGA (`USE_SERIAL=no`, default) | Built by us |
+| aarch64, UEFI, serial (`USE_SERIAL=yes`) | Built by us |
 | x86_64, legacy BIOS (Components: kernel+initramfs) | Built by us |
 
-**One image per arch, not one per console type, is a deliberate,
-not-fully-verified bet.** The kernel accepts multiple `console=`
-parameters and sends boot messages to all of them; ZFSBootMenu's own
-docs don't say whether its interactive menu itself works on more than
-one at once (only `/dev/console` - whichever `console=` was listed last
-- is guaranteed). Low-stakes to find out empirically rather than
-research further: if the non-primary console turns out unusable for the
-actual interactive menu, that's a one-line workflow change (split back
-into two builds), not a rewrite - open a PR.
+**A single combined image (both `console=` entries baked into one
+kernel command line) was tried first, and confirmed broken in
+practice.** The kernel does send boot messages to every `console=`
+listed, but only the LAST one becomes `/dev/console` - and that's the
+only one ZFSBootMenu's interactive menu actually attaches to. A real
+install showed the menu on the primary console and nothing but boot log
+on the other - not good enough for a boot-critical tool where you might
+only have one of the two available. Two images per arch costs nothing
+extra to build, so that's the default now.
 
 Point `ZBM_EFI_URL`/`ZBM_VMLINUZ_URL`/`ZBM_INITRAMFS_URL` (or the
 `_FILE` variants) at your own image instead, if you'd rather not use
