@@ -55,6 +55,11 @@ ALPINE_BRANCH=""
 # run time (see resolve_alpine_version()) - set it explicitly to pin a
 # specific release instead.
 ALPINE_VERSION="${ALPINE_VERSION:-}"
+
+# Name of the ZFS pool this script creates. "zroot" matches the name
+# ZFSBootMenu's own docs and most root-on-ZFS guides use by convention -
+# change it only if you already have another pool by that name imported
+# (e.g. multiple ZFS-root machines managed from the same rescue session).
 POOL_NAME="${POOL_NAME:-zroot}"
 ROOT_DATASET="${POOL_NAME}/ROOT/alpine"
 MOUNT_LOCATION="/mnt/alpine"
@@ -103,6 +108,15 @@ ZBM_VMLINUZ_URL="${ZBM_VMLINUZ_URL:-}"
 ZBM_VMLINUZ_FILE="${ZBM_VMLINUZ_FILE:-}"
 ZBM_INITRAMFS_URL="${ZBM_INITRAMFS_URL:-}"
 ZBM_INITRAMFS_FILE="${ZBM_INITRAMFS_FILE:-}"
+
+# Published alongside our own EFI/Components builds - the Alpine rootfs
+# gets a sha256 check a few lines below (fetch_rootfs()); these are the
+# actual bootloader, so they get one too. Only covers our own default
+# *_URL values - a custom ZBM_EFI_URL/ZBM_VMLINUZ_URL/ZBM_INITRAMFS_URL
+# pointing somewhere else (e.g. upstream's get.zfsbootmenu.org/efi) has
+# no entry in it, so verify_zbm_checksum() skips with a warning instead
+# of failing - we can't vouch for a URL we don't control.
+ZBM_CHECKSUMS_URL="https://github.com/unidoc/alpine-installer/releases/latest/download/SHA256SUMS"
 
 ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
 
@@ -205,9 +219,43 @@ looks_like_pubkey() {
     esac
 }
 
+# Verifies a downloaded file against our own published SHA256SUMS, by
+# basename. Silently (well - loudly logged, not fatal) skips verification
+# if the checksums file can't be fetched or has no entry for this
+# basename - that's expected for a custom, non-default ZBM_*_URL we don't
+# control. A checksum entry that IS found but doesn't match is always
+# fatal: that means either a corrupted download or a compromised
+# artifact, and this file is about to become the system's bootloader.
+verify_zbm_checksum() {
+    local file="$1" name="$2" sums_file
+    sums_file="$(mktemp)"
+
+    if ! curl --fail --silent --location --output "${sums_file}" "${ZBM_CHECKSUMS_URL}" 2>/dev/null; then
+        log "Could not fetch SHA256SUMS - skipping checksum verification for ${name}"
+        rm -f "${sums_file}"
+        return 0
+    fi
+
+    if ! grep -q "  ${name}\$" "${sums_file}"; then
+        log "No checksum entry for ${name} in SHA256SUMS - skipping verification"
+        rm -f "${sums_file}"
+        return 0
+    fi
+
+    (cd "$(dirname "${file}")" && grep "  ${name}\$" "${sums_file}" | sha256sum -c -) ||
+        die "Checksum mismatch for ${name} - the downloaded ZFSBootMenu artifact does not match what this repo published. Refusing to install a boot image that doesn't match its own checksum."
+    rm -f "${sums_file}"
+}
+
 # Best-effort, not authoritative - covers the common cases (KVM/Xen-HVM/
 # VMware/VirtualBox/Hyper-V on x86, QEMU's ARM "virt" machine, most cloud
 # DMI vendor strings on either arch) without needing any extra package.
+# Known real false-positive: AWS *.metal and GCP bare-metal instance
+# types are documented to still report the same "Amazon EC2"/"Google
+# Compute Engine" DMI strings as their virtualized siblings, even though
+# nothing is virtualized - VIRT=auto would wrongly pick linux-virt
+# (limited real-hardware drivers) there. Force VIRT=no explicitly on
+# those instance types.
 detect_virt() {
     if [ -r /proc/cpuinfo ] && grep -qw hypervisor /proc/cpuinfo 2>/dev/null; then
         return 0
@@ -238,14 +286,17 @@ validate_environment() {
     if [ -z "${PUBKEY}" ]; then
         die "PUBKEY is not set. Export PUBKEY=\"ssh-ed25519 AAAA... you@host\" (one or more newline-separated key lines) and re-run. There is no default key - this installer refuses to run without one."
     fi
-    local key_line
+    local key_line found_key=0
     while IFS= read -r key_line; do
         [ -z "${key_line}" ] && continue
         looks_like_pubkey "${key_line}" ||
             die "PUBKEY does not look like an SSH public key line: '${key_line}'. Expected something starting with ssh-ed25519, ssh-rsa, ecdsa-sha2-*, or sk-*."
+        found_key=1
     done <<EOF
 ${PUBKEY}
 EOF
+    [ "${found_key}" -eq 1 ] ||
+        die "PUBKEY is set but contains no actual key line (blank/whitespace only). There is no default key - this installer refuses to run without one."
 
     [ -n "${SYSHOSTNAME}" ] || die "SYSHOSTNAME is empty."
     [ -b "${SYSDRIVE}" ] || die "SYSDRIVE is not a block device: ${SYSDRIVE}"
@@ -306,6 +357,16 @@ EOF
         ''|*[!0-9]*)
             die "SWAP_SIZE_GIB must be a non-negative integer, got: ${SWAP_SIZE_GIB}"
             ;;
+    esac
+
+    case "${USE_SERIAL}" in
+        yes|no) ;;
+        # Not just an enum check: USE_SERIAL's value is spliced verbatim
+        # into the unquoted heredoc that generates chroot-install-script.sh
+        # (see write_chroot_install_script()) and later executed as root
+        # inside the chroot. An unvalidated value there is a real command
+        # injection, not just a bad-input inconvenience.
+        *) die "Unsupported USE_SERIAL: ${USE_SERIAL}. Supported values: yes and no." ;;
     esac
 
     if [ "${USE_UEFI}" = "yes" ]; then
@@ -694,6 +755,7 @@ PermitEmptyPasswords no
 PasswordAuthentication yes
 PubkeyAuthentication yes
 SSHDEOF
+chmod 0644 /etc/ssh/sshd_config.d/local.conf
 
 getent passwd sshd >/dev/null || adduser -h / -s /sbin/nologin -S sshd
 
@@ -747,6 +809,7 @@ install_zfsbootmenu_uefi() {
         curl --fail --location \
             --output "${MOUNT_LOCATION}/boot/efi/EFI/ZBM/VMLINUZ.EFI" \
             "${ZBM_EFI_URL}"
+        verify_zbm_checksum "${MOUNT_LOCATION}/boot/efi/EFI/ZBM/VMLINUZ.EFI" "$(basename "${ZBM_EFI_URL}")"
     fi
 
     cp "${MOUNT_LOCATION}/boot/efi/EFI/ZBM/VMLINUZ.EFI" \
@@ -771,6 +834,7 @@ install_zfsbootmenu_bios() {
         curl --fail --location \
             --output "${MOUNT_LOCATION}/boot/efi/vmlinuz-bootmenu" \
             "${ZBM_VMLINUZ_URL}"
+        verify_zbm_checksum "${MOUNT_LOCATION}/boot/efi/vmlinuz-bootmenu" "$(basename "${ZBM_VMLINUZ_URL}")"
     fi
 
     if [ -n "${ZBM_INITRAMFS_FILE}" ]; then
@@ -782,6 +846,7 @@ install_zfsbootmenu_bios() {
         curl --fail --location \
             --output "${MOUNT_LOCATION}/boot/efi/initramfs-bootmenu.img" \
             "${ZBM_INITRAMFS_URL}"
+        verify_zbm_checksum "${MOUNT_LOCATION}/boot/efi/initramfs-bootmenu.img" "$(basename "${ZBM_INITRAMFS_URL}")"
     fi
 
     cp "${MOUNT_LOCATION}/boot/efi/vmlinuz-bootmenu" \

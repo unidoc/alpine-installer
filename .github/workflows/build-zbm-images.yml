@@ -3,12 +3,14 @@ name: Build ZFSBootMenu images
 # Builds the ZFSBootMenu boot-image variants alpine-install-zfs.sh needs
 # that have no official pre-built download (see that script's
 # select_zbm_artifacts() and this repo's README "ZFSBootMenu artifacts"
-# section): a serial-console x86_64 EFI executable, an x86_64 Components
-# pair (separate kernel+initramfs for legacy BIOS/GRUB chainloading), and
-# an aarch64 EFI executable. Published as GitHub Release assets - not
-# GitHub Pages, not an apk repo, just raw files. This does NOT belong in
-# unidoc-aports: these aren't Alpine packages, they're boot binaries, a
-# completely different artifact shape.
+# section): one x86_64 EFI executable (VGA and serial both baked into its
+# kernel command line), an x86_64 Components pair (separate
+# kernel+initramfs for legacy BIOS/GRUB chainloading), and one aarch64
+# EFI executable (also VGA and serial). Published as GitHub Release
+# assets, alongside a SHA256SUMS covering all of them - not GitHub Pages,
+# not an apk repo, just raw files. This does NOT belong in unidoc-aports:
+# these aren't Alpine packages, they're boot binaries, a completely
+# different artifact shape.
 #
 # The x86_64 job mirrors zbm-dev/zfsbootmenu's own official release
 # build (.github/workflows/build.yml in their repo) - same pre-built
@@ -47,6 +49,15 @@ env:
 jobs:
   build-x86_64:
     runs-on: ubuntu-latest
+    # Neither build job pushes anything or calls the GitHub API - only
+    # `publish` needs a token, and even there it's scoped to just
+    # `contents: write`. Explicit `contents: read` here (rather than
+    # inheriting the repo's default token permissions) plus
+    # persist-credentials: false on the checkout keeps a real, if
+    # low-probability, supply-chain scenario (an adversarial commit at
+    # the pinned ZFSBOOTMENU_REF) from having any token to exfiltrate.
+    permissions:
+      contents: read
     container:
       # Pinned to a dated tag, not :latest/:development - reproducible,
       # bumped deliberately. Tag list:
@@ -65,6 +76,7 @@ jobs:
           repository: zbm-dev/zfsbootmenu
           ref: ${{ env.ZFSBOOTMENU_REF }}
           path: zfsbootmenu
+          persist-credentials: false
 
       - name: Point /zbm at the checkout
         run: |
@@ -155,15 +167,23 @@ jobs:
           # (it just globs "everything that isn't *.EFI"), so pick out
           # the kernel and initramfs by the substring every such file
           # has (vmlinu*/initr*) and ship them under fixed names -
-          # alpine-install-zfs.sh's defaults point at these. Also keep
-          # copies under their original names as a fallback in case this
-          # guess is wrong for some future ZFSBootMenu version; check
-          # this step's "ls -la" output above if the install script ever
-          # reports a 404 fetching these.
-          kernel_file="$(find /build/build -type f ! -name '*.EFI' -iname '*vmlinu*' | head -1)"
-          initramfs_file="$(find /build/build -type f ! -name '*.EFI' -iname '*initr*' | head -1)"
-          [ -n "${kernel_file}" ] && cp "${kernel_file}" /out/zfsbootmenu-vmlinuz
-          [ -n "${initramfs_file}" ] && cp "${initramfs_file}" /out/zfsbootmenu-initramfs.img
+          # alpine-install-zfs.sh's defaults point at these.
+          #
+          # These are hard failures, not a best-effort skip: `[ -n "$x" ]
+          # && cp ...` alone does NOT trip `set -e` when it's not the
+          # script's last command (a failing left side of `&&` mid-script
+          # is exempt) - that silently produced a "green" run with
+          # neither fixed-name file ever created, while the catch-all
+          # copy below still populated /out with the original-named
+          # files, so if-no-files-found: error on the upload step never
+          # caught it either. A wrong guess here must fail the job
+          # loudly, not ship a release the install script 404s against.
+          [ -n "${kernel_file:=$(find /build/build -type f ! -name '*.EFI' -iname '*vmlinu*' | head -1)}" ] ||
+            { echo "::error::no file matching *vmlinu* found in /build/build - see ls -la above"; exit 1; }
+          [ -n "${initramfs_file:=$(find /build/build -type f ! -name '*.EFI' -iname '*initr*' | head -1)}" ] ||
+            { echo "::error::no file matching *initr* found in /build/build - see ls -la above"; exit 1; }
+          cp "${kernel_file}" /out/zfsbootmenu-vmlinuz
+          cp "${initramfs_file}" /out/zfsbootmenu-initramfs.img
           find /build/build -type f ! -name '*.EFI' -exec cp {} /out/ \;
 
       - uses: actions/upload-artifact@v4
@@ -208,9 +228,20 @@ jobs:
           set -e
           mkdir -p build/dracut.conf.d out
           cp zfsbootmenu/etc/zfsbootmenu/dracut.conf.d/zz-console-and-zfs-fix.conf build/dracut.conf.d/
-          docker run --rm \
+          # --entrypoint sh is required, not cosmetic: the image's own
+          # ENTRYPOINT is `[ "/${ZBM_BUILDER}" ]` from its Dockerfile -
+          # Docker does NOT perform ARG/ENV variable substitution inside
+          # ENTRYPOINT or CMD instructions (unlike COPY/ENV/WORKDIR/etc,
+          # where it does), so that path is baked into the image as the
+          # literal, unexpanded string `/${ZBM_BUILDER}`. `docker run
+          # IMAGE sh -c '...'` only overrides CMD, not ENTRYPOINT - the
+          # container tried to exec that literal nonexistent path and
+          # failed with "no such file or directory" before ever reaching
+          # our script (confirmed on a real run). --entrypoint replaces
+          # ENTRYPOINT itself, sidestepping it entirely.
+          docker run --rm --entrypoint sh \
             -v "$PWD/zfsbootmenu:/zbm" -v "$PWD/build:/build" \
-            zbm-builder:local sh -c '
+            zbm-builder:local -c '
               set -e
               yq-go e "
                 .EFI.Enabled = true |
@@ -232,8 +263,14 @@ jobs:
           if-no-files-found: error
 
   publish:
+    # No `if:` here - this workflow has no pull_request trigger at all
+    # (see `on:` above), so a github.event_name check was always true
+    # and never actually gated anything. needs: alone is the real gate:
+    # a job with no status-check function in its own `if:` implicitly
+    # requires success() on everything it needs, so this can't run
+    # unless both build jobs succeeded (verified against GitHub's docs -
+    # not assumed).
     needs: [build-x86_64, build-aarch64]
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -249,9 +286,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          tag="zbm-$(date -u +%Y%m%d)"
+          sha256sum out/* | sed 's#out/##' > out/SHA256SUMS
+          # Includes the run number, not just the date - a same-day
+          # re-run (retrying after a failure, or a same-day follow-up
+          # fix) would otherwise collide with gh release create refusing
+          # a tag that already exists.
+          tag="zbm-$(date -u +%Y%m%d)-${{ github.run_number }}"
           gh release create "$tag" out/* \
             --repo "${{ github.repository }}" \
             --title "ZFSBootMenu images ($tag)" \
-            --notes "Custom-built ZFSBootMenu images (x86_64 serial-console EFI, x86_64 BIOS Components pair, aarch64 EFI) - not official ZFSBootMenu releases, built by this repo's own CI with a console/zfs-module fix on top of upstream. Consumed by alpine-install-zfs.sh's ZBM_EFI_URL/ZBM_VMLINUZ_URL/ZBM_INITRAMFS_URL." \
+            --notes "Custom-built ZFSBootMenu images (x86_64 EFI, x86_64 BIOS Components pair, aarch64 EFI) - not official ZFSBootMenu releases, built by this repo's own CI with a console/zfs-module fix on top of upstream. Consumed by alpine-install-zfs.sh's ZBM_EFI_URL/ZBM_VMLINUZ_URL/ZBM_INITRAMFS_URL. SHA256SUMS covers every asset here." \
             --latest

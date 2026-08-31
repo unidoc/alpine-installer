@@ -64,17 +64,25 @@ SWAP_SIZE_GIB="${SWAP_SIZE_GIB:-0}"
 # is intentionally the one bit of "flexibility" this script offers beyond
 # swap on/off - if you want a genuinely custom multi-LV or multi-PV
 # layout, partition and pvcreate/vgcreate/lvcreate yourself first, then
-# point ROOT_PARTITION at the resulting /dev/vgX/lvY before running this
-# (set SKIP_PARTITIONING=yes to have this script leave the disk alone).
+# point ROOT_PARTITION at the resulting /dev/vgX/lvY and set
+# SKIP_PARTITIONING=yes too. With SKIP_PARTITIONING=yes, USE_LVM=yes
+# never runs pvcreate/vgcreate/lvcreate itself (it would destroy your
+# existing volume) - it only makes sure lvm2 and mkinitfs's "lvm" feature
+# get installed, since ROOT_PARTITION already IS the final LV at that
+# point. Still set USE_LVM=yes in that case - otherwise this script has
+# no way to know your root needs LVM support at boot at all.
 USE_LVM="${USE_LVM:-no}"
 LVM_VG_NAME="${LVM_VG_NAME:-vg0}"
 LVM_LV_NAME="${LVM_LV_NAME:-root}"
 
 # "yes" skips partition_disk() entirely and uses EFI_PARTITION/
-# ROOT_PARTITION (or, with USE_LVM=yes, VG_PARTITION) exactly as given -
-# for operators who already partitioned the disk their own way and just
-# want the rest of the install (rootfs, packages, bootloader, ZFS-less
-# credentials model) done for them.
+# ROOT_PARTITION/SWAP_PARTITION exactly as given - for operators who
+# already partitioned the disk their own way and just want the rest of
+# the install (rootfs, packages, bootloader, credentials model) done for
+# them. Not validated beyond "is it a block device" - a partition table
+# that doesn't actually match USE_UEFI's assumptions (e.g. an
+# EFI_PARTITION with no ESP type-GUID, or a GPT disk with no bios_grub
+# gap for USE_UEFI=no) fails later, inside the chroot, not here.
 SKIP_PARTITIONING="${SKIP_PARTITIONING:-no}"
 
 ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
@@ -170,6 +178,12 @@ looks_like_pubkey() {
 # Best-effort, not authoritative - covers the common cases (KVM/Xen-HVM/
 # VMware/VirtualBox/Hyper-V on x86, QEMU's ARM "virt" machine, most cloud
 # DMI vendor strings on either arch) without needing any extra package.
+# Known real false-positive: AWS *.metal and GCP bare-metal instance
+# types are documented to still report the same "Amazon EC2"/"Google
+# Compute Engine" DMI strings as their virtualized siblings, even though
+# nothing is virtualized - VIRT=auto would wrongly pick linux-virt
+# (limited real-hardware drivers) there. Force VIRT=no explicitly on
+# those instance types.
 detect_virt() {
     if [ -r /proc/cpuinfo ] && grep -qw hypervisor /proc/cpuinfo 2>/dev/null; then
         return 0
@@ -200,14 +214,17 @@ validate_environment() {
     if [ -z "${PUBKEY}" ]; then
         die "PUBKEY is not set. Export PUBKEY=\"ssh-ed25519 AAAA... you@host\" (one or more newline-separated key lines) and re-run. There is no default key - this installer refuses to run without one."
     fi
-    local key_line
+    local key_line found_key=0
     while IFS= read -r key_line; do
         [ -z "${key_line}" ] && continue
         looks_like_pubkey "${key_line}" ||
             die "PUBKEY does not look like an SSH public key line: '${key_line}'. Expected something starting with ssh-ed25519, ssh-rsa, ecdsa-sha2-*, or sk-*."
+        found_key=1
     done <<EOF
 ${PUBKEY}
 EOF
+    [ "${found_key}" -eq 1 ] ||
+        die "PUBKEY is set but contains no actual key line (blank/whitespace only). There is no default key - this installer refuses to run without one."
 
     [ -n "${SYSHOSTNAME}" ] || die "SYSHOSTNAME is empty."
     [ -b "${SYSDRIVE}" ] || die "SYSDRIVE is not a block device: ${SYSDRIVE}"
@@ -250,6 +267,16 @@ EOF
         ''|*[!0-9]*)
             die "SWAP_SIZE_GIB must be a non-negative integer, got: ${SWAP_SIZE_GIB}"
             ;;
+    esac
+
+    case "${USE_SERIAL}" in
+        yes|no) ;;
+        # Not just an enum check: USE_SERIAL's value is spliced verbatim
+        # into the unquoted heredoc that generates chroot-install-script.sh
+        # (see write_chroot_install_script()) and later executed as root
+        # inside the chroot. An unvalidated value there is a real command
+        # injection, not just a bad-input inconvenience.
+        *) die "Unsupported USE_SERIAL: ${USE_SERIAL}. Supported values: yes and no." ;;
     esac
 
     case "${VIRT}" in
@@ -389,7 +416,16 @@ partition_disk() {
             swap) fstype="linux-swap" ;;
             root) fstype="ext4" ;;
         esac
-        parted_args+=(mkpart primary "${fstype}" "${start}" "${part_ends[$i]}" name "$((i + 1))" "${part_names[$i]}")
+        parted_args+=(mkpart primary "${fstype}" "${start}" "${part_ends[$i]}")
+        # parted's "name" subcommand only works on GPT (and Mac/PC98)
+        # labels - msdos partition tables have no concept of a partition
+        # name and parted errors out on it. Since USE_UEFI=no selects
+        # msdos a few lines up, this has to be conditional or every
+        # legacy-BIOS install fails here - after wipefs has already
+        # destroyed the disk's previous partition table.
+        if [ "${USE_UEFI}" = "yes" ]; then
+            parted_args+=(name "$((i + 1))" "${part_names[$i]}")
+        fi
         if [ -n "${part_flags[$i]}" ]; then
             parted_args+=(set "$((i + 1))" "${part_flags[$i]}" on)
         fi
@@ -419,6 +455,18 @@ partition_disk() {
 
 setup_lvm() {
     [ "${USE_LVM}" = "yes" ] || return 0
+
+    if [ "${SKIP_PARTITIONING}" = "yes" ]; then
+        # Never pvcreate/vgcreate/lvcreate here when the operator already
+        # partitioned (and possibly already LVM'd) the disk themselves -
+        # `pvcreate -f` would silently destroy/reformat their existing
+        # volume as a nested PV. USE_LVM=yes + SKIP_PARTITIONING=yes means
+        # "ROOT_PARTITION already IS the final LV, just make sure lvm2 and
+        # mkinitfs's lvm feature get installed" (see write_chroot_install_script()) -
+        # nothing to create here.
+        log "SKIP_PARTITIONING=yes - using ${ROOT_PARTITION} as the pre-existing LV, not creating a new PV/VG/LV"
+        return 0
+    fi
 
     log "Creating LVM volume group ${LVM_VG_NAME} and logical volume ${LVM_LV_NAME}"
     pvcreate -f "${ROOT_PARTITION}"
@@ -700,6 +748,7 @@ PermitEmptyPasswords no
 PasswordAuthentication yes
 PubkeyAuthentication yes
 SSHDEOF
+chmod 0644 /etc/ssh/sshd_config.d/local.conf
 
 getent passwd sshd >/dev/null || adduser -h / -s /sbin/nologin -S sshd
 

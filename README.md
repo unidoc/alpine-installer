@@ -99,8 +99,9 @@ you need to override, run the script, nothing to edit. Both scripts:
 | `SWAP_SIZE_GIB` | `2` (zfs) / `0` (normal) | Swap partition size; `0` disables it |
 | `VIRT` | `auto` | `auto`/`yes`/`no` - `yes` installs `linux-virt`, `no` installs `linux-lts`. `auto` guesses from a CPUID hypervisor flag, an ARM hypervisor device-tree node, and DMI vendor strings (see `detect_virt()`) - a heuristic, not a certainty; force it if you already know |
 
-`alpine-install-zfs.sh` also has `POOL_NAME` and the `ZBM_*` overrides
-described in its header comment - see "ZFSBootMenu artifacts" below.
+`alpine-install-zfs.sh` also has `POOL_NAME` (documented inline above its
+declaration in the script) and the `ZBM_*` overrides - see "ZFSBootMenu
+artifacts" below.
 
 `alpine-install-normal.sh` also has:
 
