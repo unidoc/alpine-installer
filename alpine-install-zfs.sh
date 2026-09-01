@@ -86,7 +86,20 @@ ALPINE_VERSION="${ALPINE_VERSION:-}"
 POOL_NAME="${POOL_NAME:-zroot}"
 ROOT_DATASET="${POOL_NAME}/ROOT/alpine"
 MOUNT_LOCATION="/mnt/alpine"
-USE_SERIAL="${USE_SERIAL:-no}"
+
+# "auto" (default) checks the rescue system's OWN kernel command line
+# for console=ttyS0 (x86_64) / console=ttyAMA0 (aarch64) - see
+# detect_serial() below. Deliberately not "check the live tty" (e.g.
+# `tty` or $SSH_TTY): if this rescue session is reached over SSH, the
+# controlling tty is a pts that says nothing about which physical/
+# remote-console channel will actually be available to interact with
+# ZFSBootMenu after reboot, since SSH isn't available that early in
+# boot. What the rescue kernel itself was told to use as a console is a
+# much better signal - a bare-metal/VPS host with no VGA almost always
+# has its rescue image booted with console=ttyS0 for exactly the same
+# reason the installed system will need it too. Still a heuristic -
+# force "yes"/"no" if you already know.
+USE_SERIAL="${USE_SERIAL:-auto}"
 SWAP_SIZE_GIB="${SWAP_SIZE_GIB:-2}"
 
 # "auto" (default) guesses from a CPUID hypervisor flag / ARM
@@ -230,16 +243,19 @@ ensure_apk_updated() {
 }
 
 # Some rescue images don't ship every tool this script needs by default
-# (gptfdisk/sgdisk in particular, seen missing on a real alpine-rescue
-# boot even though this is a ZFS-focused rescue image) - install it
-# automatically rather than making the operator do it by hand on every
-# single run. Best-effort only: if apk isn't available, there's no
-# network, or the package genuinely doesn't provide the command, the
-# command -v recheck in require_command() below still catches it and
-# dies with a clear message either way.
+# (sgdisk in particular, seen missing on a real alpine-rescue boot even
+# though this is a ZFS-focused rescue image) - install it automatically
+# rather than making the operator do it by hand on every single run.
+# Best-effort only: if apk isn't available, there's no network, or the
+# package genuinely doesn't provide the command, the command -v recheck
+# in require_command() below still catches it and dies with a clear
+# message either way.
 apk_package_for_command() {
     case "$1" in
-        sgdisk) echo "gptfdisk" ;;
+        # Alpine packages this as plain "sgdisk", not "gptfdisk" (the
+        # upstream project/Debian package name) - got this wrong once
+        # already, don't reintroduce it.
+        sgdisk) echo "sgdisk" ;;
         mkfs.vfat) echo "dosfstools" ;;
         zfs|zpool|zgenhostid) echo "zfs" ;;
         *) echo "" ;;
@@ -357,6 +373,24 @@ detect_virt() {
     return 1
 }
 
+# Best-effort: see the USE_SERIAL comment above for why this checks the
+# rescue system's own boot-time console= setting rather than the live
+# tty.
+detect_serial() {
+    local cmdline serial_dev
+    [ -r /proc/cmdline ] || return 1
+    cmdline="$(cat /proc/cmdline)"
+    case "${ARCH}" in
+        x86_64) serial_dev="ttyS" ;;
+        aarch64) serial_dev="ttyAMA" ;;
+        *) return 1 ;;
+    esac
+    case " ${cmdline} " in
+        *" console=${serial_dev}"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # ==============================================================================
 # Install phases
 # ==============================================================================
@@ -441,13 +475,23 @@ EOF
     esac
 
     case "${USE_SERIAL}" in
+        auto)
+            if detect_serial; then
+                USE_SERIAL="yes"
+            else
+                USE_SERIAL="no"
+            fi
+            log "USE_SERIAL=auto detected USE_SERIAL=${USE_SERIAL}"
+            ;;
         yes|no) ;;
         # Not just an enum check: USE_SERIAL's value is spliced verbatim
         # into the unquoted heredoc that generates chroot-install-script.sh
         # (see write_chroot_install_script()) and later executed as root
         # inside the chroot. An unvalidated value there is a real command
-        # injection, not just a bad-input inconvenience.
-        *) die "Unsupported USE_SERIAL: ${USE_SERIAL}. Supported values: yes and no." ;;
+        # injection, not just a bad-input inconvenience - resolving
+        # "auto" to a literal yes/no above, before this check, keeps
+        # that guarantee intact.
+        *) die "Unsupported USE_SERIAL: ${USE_SERIAL}. Supported values: auto, yes, and no." ;;
     esac
 
     if [ "${USE_UEFI}" = "yes" ]; then

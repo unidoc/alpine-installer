@@ -109,7 +109,7 @@ you need to override, run the script, nothing to edit. Both scripts:
 | `SYSHOSTNAME` | `alpine` | Hostname |
 | `ALPINE_VERSION` | *(auto-detected)* | Pin a specific Alpine release |
 | `USE_UEFI` | `auto` | `auto`/`yes`/`no` - detects `/sys/firmware/efi` |
-| `USE_SERIAL` | `no` | Enable the serial console (`ttyS0`/`ttyAMA0`) |
+| `USE_SERIAL` | `auto` | `auto`/`yes`/`no` - `auto` checks the rescue system's own kernel command line for `console=ttyS0`/`console=ttyAMA0` (see `detect_serial()`) rather than the live tty, since an SSH session into the rescue system says nothing about what will actually be available to reach ZFSBootMenu after reboot |
 | `SWAP_SIZE_GIB` | `2` (zfs) / `0` (normal) | Swap partition size; `0` disables it |
 | `VIRT` | `auto` | `auto`/`yes`/`no` - `yes` installs `linux-virt`, `no` installs `linux-lts`. `auto` guesses from a CPUID hypervisor flag, an ARM hypervisor device-tree node, and DMI vendor strings (see `detect_virt()`) - a heuristic, not a certainty; force it if you already know |
 
