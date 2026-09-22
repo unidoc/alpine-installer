@@ -1693,6 +1693,42 @@ rc-update add alpine-zfsboot-bootcheck default
 
 echo button >> /etc/modules
 
+# vfat is a loadable module on Alpine's own linux-virt/linux-lts
+# kernels, not built in (CONFIG_VFAT_FS=m) - confirmed the hard way on
+# a real running host: apk upgrade had already deleted
+# /lib/modules/<old-running-kernel>/ (Alpine only keeps the modules for
+# the CURRENTLY INSTALLED kernel package, not the one still actually
+# running until the next reboot), so a later \`mount /boot/efi\` on that
+# same still-running-old-kernel boot failed with "No such device" -
+# modprobe vfat had nowhere left to load it from. This line does not
+# load anything now; it makes OpenRC's \`modules\` service (enabled in
+# the boot runlevel above) load vfat EARLY ON EVERY BOOT of the
+# installed system, while the running kernel's own module directory is
+# still intact, so it is already resident by the time any later
+# \`apk upgrade\` empties that directory out from under the running
+# kernel. UEFI only - legacy BIOS mode (GRUB installs straight to the
+# disk's own boot sector) has no vfat filesystem anywhere on the disk
+# at all.
+if [ "${USE_UEFI}" != "no" ]; then
+    echo vfat >> /etc/modules
+    # FAT loads its codepage AND iocharset NLS tables lazily, inside
+    # the mount() call itself (fat_fill_super -> load_nls("cp437")
+    # for the codepage, load_nls("utf8") for the default iocharset,
+    # both via request_module) - neither is a module dependency of
+    # vfat, so modprobe/loading vfat alone does not bring them in.
+    # Confirmed directly on a real host, not inferred: \`mount
+    # /boot/efi && lsmod | grep -E '^(fat|vfat|nls_)'\` on a machine
+    # with matching kernel/modules shows nls_cp437 AND nls_utf8 both
+    # get pulled in by that one mount, each with a use count from the
+    # mount itself - not from vfat. Without both of these lines the
+    # stranded-modules mount above still fails (just with a different
+    # error - "codepage cp437 not found" or an iocharset failure,
+    # EINVAL either way, instead of "No such device"/ENODEV) - the
+    # same unusable ESP regardless of which piece is missing.
+    echo nls_cp437 >> /etc/modules
+    echo nls_utf8 >> /etc/modules
+fi
+
 # Last Boot Diagnostics - OpenRC's own stock service logger
 # (rc_logger="YES" in /etc/rc.conf, default rc_log_path=/var/log/rc.log)
 # writes every service's start/stop output there, including the exact
