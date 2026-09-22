@@ -1693,25 +1693,33 @@ rc-update add alpine-zfsboot-bootcheck default
 
 echo button >> /etc/modules
 
-# vfat is a loadable module on Alpine's own linux-virt/linux-lts kernels,
-# not built in - confirmed the hard way on a real running host: apk
-# upgrade had already deleted /lib/modules/<old-running-kernel>/ (Alpine
-# only keeps the modules for the CURRENTLY INSTALLED kernel package, not
-# the one still actually running until the next reboot), so a later
-# \`mount /boot/efi\` on that same still-running-old-kernel boot failed
-# with "No such device" - modprobe vfat had nowhere left to load it
-# from. Loading it once here, unconditionally at THIS boot (while this
-# kernel's own modules are still guaranteed present, since this script
-# runs inside the freshly-installed chroot before any upgrade could ever
-# remove them), keeps it resident in memory for the rest of that boot's
-# uptime regardless of what a future \`apk upgrade\` later does to the
-# on-disk module directory - same reasoning as the button module above,
-# and the same real gap format_boot_partition()'s own \`modprobe vfat\`
-# call already works around during install, just persisted past install
-# time too now. UEFI only - legacy BIOS mode has no vfat filesystem
-# anywhere on the disk at all (see this file's own disk-layout comment).
+# vfat is a loadable module on Alpine's own linux-virt/linux-lts
+# kernels, not built in (CONFIG_VFAT_FS=m) - confirmed the hard way on
+# a real running host: apk upgrade had already deleted
+# /lib/modules/<old-running-kernel>/ (Alpine only keeps the modules for
+# the CURRENTLY INSTALLED kernel package, not the one still actually
+# running until the next reboot), so a later \`mount /boot/efi\` on that
+# same still-running-old-kernel boot failed with "No such device" -
+# modprobe vfat had nowhere left to load it from. This line does not
+# load anything now; it makes OpenRC's \`modules\` service (enabled in
+# the boot runlevel above) load vfat EARLY ON EVERY BOOT of the
+# installed system, while the running kernel's own module directory is
+# still intact, so it is already resident by the time any later
+# \`apk upgrade\` empties that directory out from under the running
+# kernel. UEFI only - legacy BIOS mode (GRUB installs straight to the
+# disk's own boot sector) has no vfat filesystem anywhere on the disk
+# at all.
 if [ "${USE_UEFI}" != "no" ]; then
     echo vfat >> /etc/modules
+    # FAT loads its codepage NLS table lazily, inside the mount()
+    # call itself (fat_fill_super -> load_nls("cp437") ->
+    # request_module), and nls_cp437 is NOT a module dependency of
+    # vfat - modprobe vfat does not bring it in. Alpine builds it as
+    # a module too (CONFIG_NLS_CODEPAGE_437=m), so without this line
+    # the stranded-modules mount above still fails, just with a
+    # different error ("codepage cp437 not found"/EINVAL instead of
+    # "No such device"/ENODEV) - the same unusable ESP either way.
+    echo nls_cp437 >> /etc/modules
 fi
 
 # Last Boot Diagnostics - OpenRC's own stock service logger
