@@ -16,7 +16,7 @@ non-standard partition layout, or want to avoid ZFS's operational model
 ```sh
 wget https://raw.githubusercontent.com/unidoc/alpine-installer/master/alpine-install-zfs.sh
 chmod +x alpine-install-zfs.sh
-PUBKEY="ssh-ed25519 AAAA... you@host" SYSDRIVE=/dev/sda ./alpine-install-zfs.sh
+PUBKEY="ssh-ed25519 AAAA... you@host" SYSDRIVE="/dev/sda" ./alpine-install-zfs.sh
 ```
 
 or, for a plain (non-ZFS) install:
@@ -24,7 +24,7 @@ or, for a plain (non-ZFS) install:
 ```sh
 wget https://raw.githubusercontent.com/unidoc/alpine-installer/master/alpine-install-normal.sh
 chmod +x alpine-install-normal.sh
-PUBKEY="ssh-ed25519 AAAA... you@host" SYSDRIVE=/dev/sda ./alpine-install-normal.sh
+PUBKEY="ssh-ed25519 AAAA... you@host" SYSDRIVE="/dev/sda" ./alpine-install-normal.sh
 ```
 
 **These scripts destroy all data on `SYSDRIVE` without a confirmation
@@ -42,6 +42,19 @@ it's an easy typo to make worse (`sh bash script.sh` isn't `bash
 script.sh`, it's `sh` trying to open a file literally named `bash`). If
 you'd rather not `chmod +x`, `bash script.sh` also works - just not
 plain `sh`.
+
+**Quote every `VAR="value"`, always - including plain words like
+`SYSDRIVE="/dev/sda"` or `USE_SERIAL="no"`.** They don't strictly need
+quotes on their own, but once you're adding several variables to one
+command line it's easy to put one `VAR="value"` *inside* another one's
+quotes by mistake - `PUBKEY="...key... USE_SERIAL="no" ...comment"`
+looks reasonable but the second `"` there just closes and reopens
+`PUBKEY`'s own quoting (bash doesn't nest double quotes), silently
+merging `USE_SERIAL="no"` into the PUBKEY value instead of setting it as
+its own variable. Quoting everything, every time, means there's only
+one pattern to follow instead of a rule about which variables "need"
+it - each `VAR="value"` stays visually self-contained and the mistake
+above becomes obvious instead of silent.
 
 ## Which one do I want?
 
