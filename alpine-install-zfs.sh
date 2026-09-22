@@ -1711,15 +1711,22 @@ echo button >> /etc/modules
 # at all.
 if [ "${USE_UEFI}" != "no" ]; then
     echo vfat >> /etc/modules
-    # FAT loads its codepage NLS table lazily, inside the mount()
-    # call itself (fat_fill_super -> load_nls("cp437") ->
-    # request_module), and nls_cp437 is NOT a module dependency of
-    # vfat - modprobe vfat does not bring it in. Alpine builds it as
-    # a module too (CONFIG_NLS_CODEPAGE_437=m), so without this line
-    # the stranded-modules mount above still fails, just with a
-    # different error ("codepage cp437 not found"/EINVAL instead of
-    # "No such device"/ENODEV) - the same unusable ESP either way.
+    # FAT loads its codepage AND iocharset NLS tables lazily, inside
+    # the mount() call itself (fat_fill_super -> load_nls("cp437")
+    # for the codepage, load_nls("utf8") for the default iocharset,
+    # both via request_module) - neither is a module dependency of
+    # vfat, so modprobe/loading vfat alone does not bring them in.
+    # Confirmed directly on a real host, not inferred: \`mount
+    # /boot/efi && lsmod | grep -E '^(fat|vfat|nls_)'\` on a machine
+    # with matching kernel/modules shows nls_cp437 AND nls_utf8 both
+    # get pulled in by that one mount, each with a use count from the
+    # mount itself - not from vfat. Without both of these lines the
+    # stranded-modules mount above still fails (just with a different
+    # error - "codepage cp437 not found" or an iocharset failure,
+    # EINVAL either way, instead of "No such device"/ENODEV) - the
+    # same unusable ESP regardless of which piece is missing.
     echo nls_cp437 >> /etc/modules
+    echo nls_utf8 >> /etc/modules
 fi
 
 # Last Boot Diagnostics - OpenRC's own stock service logger
