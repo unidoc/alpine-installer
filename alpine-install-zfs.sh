@@ -225,6 +225,16 @@ ZROOT_PASSPHRASE="${ZROOT_PASSPHRASE:-}"
 # keep in sync across both repos. All optional; nothing here is
 # required for a plain, non-rescue install.
 #
+# UEFI ONLY. There is no ESP at all in legacy BIOS mode (USE_UEFI=no) -
+# alpine-zfsboot's own /init reads this material from exactly one
+# place, a vfat filesystem labelled EFI carrying
+# /EFI/alpine-zfsboot/{config,authorized_keys,ssh_host_ed25519_key},
+# and BIOS mode's own disk layout never creates one (see this file's
+# own disk-layout comment). validate_environment() dies if any of
+# these are set together with USE_UEFI=no, rather than silently
+# writing nothing and reporting success - a real, confirmed gap in an
+# earlier version of this installer.
+#
 # ALPINE_ZFSBOOT_SSH_KEY is the one exception to the cmdline-mirror
 # rule above - it has no alpine-zfsboot.* cmdline equivalent at all.
 # Takes a RAW pubkey line (or several, newline-separated, exactly like
@@ -740,6 +750,28 @@ EOF
             die "ALPINE_ZFSBOOT_SSH_KEY is set but contains no actual key line (blank/whitespace only)."
     fi
 
+    # Every ALPINE_ZFSBOOT_* setting is persisted to the ESP - see that
+    # variable group's own top-of-file comment - and legacy BIOS mode
+    # creates no ESP at all. Without this check the install would
+    # silently write none of it and still report success: the operator
+    # sets rescue SSH up, gets no error, and discovers it was never
+    # reachable exactly when they need it most (a headless BIOS-only
+    # cloud host, mid-outage). Fail loudly here instead, at the same
+    # validation stage every other misconfiguration in this function is
+    # caught at, not partway through an otherwise-successful install.
+    if [ "${USE_UEFI}" = "no" ]; then
+        for zfsboot_v in "${ALPINE_ZFSBOOT_SSH_KEY}" "${ALPINE_ZFSBOOT_NET}" \
+                "${ALPINE_ZFSBOOT_IPV4}" "${ALPINE_ZFSBOOT_IPV4_ADDRESS}" \
+                "${ALPINE_ZFSBOOT_IPV4_GATEWAY}" "${ALPINE_ZFSBOOT_IPV6}" \
+                "${ALPINE_ZFSBOOT_IPV6_ADDRESS}" "${ALPINE_ZFSBOOT_IPV6_GATEWAY}" \
+                "${ALPINE_ZFSBOOT_SSH_LISTEN}" "${ALPINE_ZFSBOOT_SSH_PORT}" \
+                "${ALPINE_ZFSBOOT_SSH_ALLOW}"
+        do
+            [ -z "${zfsboot_v}" ] ||
+                die "ALPINE_ZFSBOOT_* settings are persisted to the ESP, and legacy BIOS mode (USE_UEFI=no) creates no ESP - alpine-zfsboot's /init has no other place to read them from. Unset them, or install in UEFI mode."
+        done
+    fi
+
     case "${SWAP_SIZE_GIB}" in
         ''|*[!0-9]*)
             die "SWAP_SIZE_GIB must be a non-negative integer, got: ${SWAP_SIZE_GIB}"
@@ -800,7 +832,7 @@ EOF
     fi
 
     for command in \
-        awk base64 blkid chroot curl getent grep install lsblk mkfs.vfat mktemp \
+        awk blkid chroot curl getent grep install lsblk mkfs.vfat mktemp \
         modprobe mount mountpoint mkswap od partprobe sha256sum sgdisk tar \
         tr umount wipefs zfs zgenhostid zpool
     do
@@ -813,8 +845,14 @@ EOF
     # Only required when actually needed - a plain, non-rescue install
     # (ALPINE_ZFSBOOT_SSH_KEY unset) must not fail or auto-install a
     # package just because this ONE optional feature wasn't requested,
-    # same posture as the DISK_LAYOUT-gated pair above.
-    if [ -n "${ALPINE_ZFSBOOT_SSH_KEY}" ]; then
+    # same posture as the DISK_LAYOUT-gated pair above. The explicit
+    # USE_UEFI=yes here is belt-and-suspenders, not load-bearing on its
+    # own - the BIOS-mode die() above already refuses a non-empty
+    # ALPINE_ZFSBOOT_SSH_KEY together with USE_UEFI=no before execution
+    # ever reaches this line - but spelling it out here too means this
+    # line's own correctness doesn't depend on tracing back through the
+    # rest of the function to see why it's safe.
+    if [ -n "${ALPINE_ZFSBOOT_SSH_KEY}" ] && [ "${USE_UEFI}" = "yes" ]; then
         require_command "dropbearkey"
     fi
 
@@ -996,7 +1034,6 @@ partition_disk() {
         zpool export "${POOL_NAME}"
     fi
 
-    zpool labelclear -f "${SYSDRIVE}" 2>/dev/null || true
     wipefs -a "${SYSDRIVE}"
     # Always zap any existing GPT structures first, even when writing an
     # msdos table below - not decoration: stage2's own GPT-then-MBR
@@ -1319,6 +1356,11 @@ fetch_rootfs() {
 
 write_base_config() {
     log "Preparing base configuration"
+    cat > "${MOUNT_LOCATION}/etc/apk/repositories" <<EOF
+${ALPINE_MIRROR}/${ALPINE_BRANCH}/main
+${ALPINE_MIRROR}/${ALPINE_BRANCH}/community
+EOF
+
     # pkg.unidoc.io alongside the stock Alpine mirrors - lets
     # write_chroot_install_script() below `apk add alpine-zfsboot`
     # (cmd/tool, this project's own install-time check/update helper -
@@ -1327,16 +1369,29 @@ write_base_config() {
     # needed. ${ALPINE_BRANCH} is already in exactly the format
     # pkg.unidoc.io's own URL scheme expects (e.g. "v3.24" - confirmed
     # against unidoc-aports' own README), the same variable the two
-    # stock mirror lines below already use.
-    cat > "${MOUNT_LOCATION}/etc/apk/repositories" <<EOF
-${ALPINE_MIRROR}/${ALPINE_BRANCH}/main
-${ALPINE_MIRROR}/${ALPINE_BRANCH}/community
-https://pkg.unidoc.io/${ALPINE_BRANCH}/main
-EOF
-    mkdir -p "${MOUNT_LOCATION}/etc/apk/keys"
-    curl --fail --location \
-        --output "${MOUNT_LOCATION}/etc/apk/keys/unidoc-aports.rsa.pub" \
-        https://pkg.unidoc.io/keys/unidoc-aports.rsa.pub
+    # stock mirror lines above already use - but unlike those two,
+    # pkg.unidoc.io does not publish every Alpine branch (only whatever
+    # its own CI currently targets), and this line lands in the
+    # INSTALLED system's permanent /etc/apk/repositories, not just this
+    # install run. Checked for real before writing it, rather than
+    # assumed: a repo entry for a branch pkg.unidoc.io never published
+    # would sit there warning on every future `apk` command forever,
+    # and (once alpine-zfsboot is actually published there) turn what
+    # write_chroot_install_script()'s own best-effort `apk add
+    # alpine-zfsboot` treats as "package doesn't exist yet" into a
+    # permanently unresolvable one instead.
+    if curl --fail --silent --location --head \
+            "https://pkg.unidoc.io/${ALPINE_BRANCH}/main/${ARCH}/APKINDEX.tar.gz" \
+            >/dev/null 2>&1; then
+        echo "https://pkg.unidoc.io/${ALPINE_BRANCH}/main" >> "${MOUNT_LOCATION}/etc/apk/repositories"
+        mkdir -p "${MOUNT_LOCATION}/etc/apk/keys"
+        curl --fail --location \
+            --output "${MOUNT_LOCATION}/etc/apk/keys/unidoc-aports.rsa.pub" \
+            https://pkg.unidoc.io/keys/unidoc-aports.rsa.pub ||
+            die "pkg.unidoc.io's own APKINDEX for ${ALPINE_BRANCH}/${ARCH} is reachable, but fetching its signing key (https://pkg.unidoc.io/keys/unidoc-aports.rsa.pub) failed - transient outage? Re-run once it's back."
+    else
+        log "pkg.unidoc.io has no published repository for ${ALPINE_BRANCH}/${ARCH} - skipping (alpine-zfsboot/cmd/tool will not be available via apk on this install; the bootloader itself is unaffected)"
+    fi
 
     cat > "${MOUNT_LOCATION}/etc/resolv.conf" <<'EOF'
 nameserver 8.8.8.8
@@ -1499,15 +1554,9 @@ set -eu
 apk update
 apk upgrade
 
-# alpine-zfsboot in the list below is cmd/tool - the install-time
-# check/update helper for the .EFI this same install just wrote. From
-# pkg.unidoc.io, not a stock Alpine package - write_base_config()
-# already added that repo and its signing key above, before this
-# chroot script ever runs.
 apk add \
     alpine-base \
     acpid \
-    alpine-zfsboot \
     bash \
     chrony \
     curl \
@@ -1528,21 +1577,33 @@ apk add \
     zfs-scripts \
     ${ZFS_KMOD_PACKAGE}
 
+# cmd/tool - the install-time check/update helper for the .EFI this
+# same install just wrote. From pkg.unidoc.io, not a stock Alpine
+# package - write_base_config() already added that repo and its
+# signing key above, before this chroot script ever runs. Best-effort,
+# NOT in the apk add list above: cmd/tool is a convenience, not
+# something the actual bootloader depends on (install_alpine_zfsboot()
+# writes the real boot code separately, after this chroot script
+# finishes) - a missing/unpublished package here must not take an
+# otherwise-successful install down under this script's own set -eu.
+apk add --quiet alpine-zfsboot ||
+    echo "WARNING: alpine-zfsboot (cmd/tool) unavailable - skipping. The bootloader itself is unaffected; install it later with: apk add alpine-zfsboot"
+
 echo 'LANG=en_US.UTF-8' > /etc/profile.d/locale.sh
 
 # alpine-zfsboot's own failed-boot detection ("bootcheck" - see boot-
 # dataset.sh/init's own design comments in the alpine-zfsboot repo for
 # the full mechanism) - this is the TARGET side's own acknowledgement
 # that a boot genuinely reached real multi-user readiness, not just
-# "the kernel started" or "root mounted". `after *` (confirmed against
+# "the kernel started" or "root mounted". \`after *\` (confirmed against
 # real OpenRC source, not assumed) makes this service start only after
 # every other service already scheduled in the SAME runlevel has - it
 # MUST be unquoted (a quoted "*" is a silent no-op, becoming a literal
 # dependency name that never resolves) and must NOT carry
-# `keyword -timeout` (that keyword makes anything waiting on this
+# \`keyword -timeout\` (that keyword makes anything waiting on this
 # specific service block up to 60s - an accident waiting to happen if
 # copied from a different service's own keyword set, not needed here).
-# `default` is confirmed the correct, genuinely-last runlevel on
+# \`default\` is confirmed the correct, genuinely-last runlevel on
 # Alpine specifically (Alpine's own rc patches always walk
 # sysinit -> boot -> default in that fixed order, each level's
 # services fully started before the next begins).
@@ -1871,38 +1932,41 @@ write_alpine_zfsboot_esp_config() {
 # (LBA 0), and stage2 + the boot blob onto the two dedicated partitions
 # partition_disk() already created for them at the right position/size.
 #
-# Only the first 446 bytes of LBA 0 are ever touched, never the whole 512-
-# byte sector - bytes 446-509 are the REAL partition table entry
-# partition_disk() already wrote there, and bytes 510-511 are the 0xAA55
-# boot signature it also already wrote correctly. Which tool wrote that
-# table depends on DISK_LAYOUT: sgdisk's own protective-MBR GPT partition
-# entry for DISK_LAYOUT=gpt (the default), or sfdisk's own real primary
-# partition table for DISK_LAYOUT=msdos - either way stage1.bin's own copy
-# of bytes 446-511 is just zero padding, since stage1.bin was built with no
-# knowledge of this specific disk's actual partition layout (see the
-# alpine-zfsboot repo's bios/stage1.S for the authoritative version of this
-# same warning). Overwriting either would leave the disk with a broken
-# partition table - every partitioning tool, and BIOS firmware itself,
-# cares about both of those, unlike stage1's own now-overwritten code
-# region.
+# Only the first 440 bytes of LBA 0 are ever touched, never the whole 512-
+# byte sector - bytes 440-443 are the MBR disk identifier (written by
+# sfdisk in DISK_LAYOUT=msdos mode; GPT mode has no equivalent to lose,
+# a protective MBR carries no disk signature), bytes 446-509 are the REAL
+# partition table entry partition_disk() already wrote, and bytes 510-511
+# are the 0xAA55 boot signature it also already wrote correctly. A wider
+# 446-byte write silently zeroes the disk identifier back out on every
+# msdos-layout install (stage1.bin's own bytes past its ~56 bytes of real
+# code are zero padding, not preserved content) - confirmed on a real
+# loop device: `blkid -p` loses the partition-table UUID entirely after a
+# 446-byte write, stays intact at 440. Which tool wrote the partition
+# table itself depends on DISK_LAYOUT: sgdisk's own protective-MBR GPT
+# partition entry for DISK_LAYOUT=gpt (the default), or sfdisk's own real
+# primary partition table for DISK_LAYOUT=msdos - either way, overwriting
+# it would leave the disk with a broken partition table - every
+# partitioning tool, and BIOS firmware itself, cares about that, unlike
+# stage1's own now-overwritten code region.
 install_alpine_zfsboot_bios() {
-    # bs=446 count=1 - ONE single 446-byte write, not 446 separate
+    # bs=440 count=1 - ONE single 440-byte write, not 440 separate
     # single-byte ones (an earlier version of this line used `bs=1
-    # count=446`, which really did write successfully by dd's own exit
+    # count=440`, which really did write successfully by dd's own exit
     # status every time, yet a REAL run's own read-back still didn't
     # match past the first ~64 bytes: confirmed directly via a hex dump
     # of both sides on a real failure - bytes 0-63 matched exactly,
     # stage1.bin's actual content past its ~56 bytes of real code is
-    # all zero out to the 446-byte mark, and the disk's own read-back
-    # diverged from that somewhere past byte 64. 446 separate 1-byte
+    # all zero out to the 440-byte mark, and the disk's own read-back
+    # diverged from that somewhere past byte 64. 440 separate 1-byte
     # write() calls to a raw block device is not the standard, well-
     # established way to write boot-sector code (every real-world MBR
-    # installer uses one bs=446 write) for exactly this reason - it's
-    # 446 separate opportunities for a sub-sector read-modify-write
+    # installer uses one bs=440 write) for exactly this reason - it's
+    # 440 separate opportunities for a sub-sector read-modify-write
     # cycle (what the block layer does under the hood for a write
     # smaller than the device's own logical/physical sector size) to
     # not fully land, instead of one atomic operation.
-    dd if="${WORKDIR}/stage1.bin" of="${SYSDRIVE}" bs=446 count=1 conv=notrunc status=none
+    dd if="${WORKDIR}/stage1.bin" of="${SYSDRIVE}" bs=440 count=1 conv=notrunc status=none
 
     dd if="${WORKDIR}/stage2.bin" of="${BIOS_BOOT_PARTITION}" bs=512 conv=notrunc status=none
 
@@ -1961,26 +2025,33 @@ verify_installation() {
             local expected_file="$1" actual_device="$2" expected_bytes="$3" label="$4"
             local tmp_expected tmp_actual cmp_out offset window_start
 
-            # Plain temp files, NOT process substitution (`<(...)`) -
-            # an earlier version of this used two `<(...)` per cmp call,
-            # confirmed a real, reproducible bug: `cmp` itself failing
-            # with "/dev/fd/NN: No such file or directory" - bash's
+            # Fast path: cmp -n bounds the comparison to expected_bytes
+            # and reads both sides directly - no tmpfs copy of either
+            # side needed at all on the common (matching) case. The
+            # boot-blob comparison specifically is real-world tens of
+            # MB (the actual v0.1.0 release asset is ~72 MB); copying
+            # that TWICE into tmpfs (RAM, on a rescue initramfs) on
+            # every successful install, on top of the copy already
+            # sitting in WORKDIR, bought nothing.
+            if cmp -s -n "${expected_bytes}" "${expected_file}" "${actual_device}"; then
+                return 0
+            fi
+
+            # Mismatch - only now pay for local copies. Plain temp
+            # files, NOT process substitution (`<(...)`) - an earlier
+            # version of this used two `<(...)` per cmp call, confirmed
+            # a real, reproducible bug: `cmp` itself failing with
+            # "/dev/fd/NN: No such file or directory" - bash's
             # process-substitution fds are not guaranteed to survive
             # being read twice in a row across two SEPARATE cmp
-            # invocations (one plain `cmp -s`, then another wrapped in
-            # `$(...)` for its own text output) the way a real
-            # regular file trivially does. This diagnostic exists to
-            # explain a real mismatch, not to add a second, different
-            # failure mode on top of it.
+            # invocations (the fast-path check above, then this one for
+            # its own text output) the way a real regular file trivially
+            # does. This diagnostic exists to explain a real mismatch,
+            # not to add a second, different failure mode on top of it.
             tmp_expected="$(mktemp)"
             tmp_actual="$(mktemp)"
             head -c "${expected_bytes}" "${expected_file}" > "${tmp_expected}"
             head -c "${expected_bytes}" "${actual_device}" > "${tmp_actual}"
-
-            if cmp -s "${tmp_expected}" "${tmp_actual}"; then
-                rm -f "${tmp_expected}" "${tmp_actual}"
-                return 0
-            fi
 
             # A fixed-size preview from the very START of the range
             # isn't enough (a real, confirmed miss: an earlier version
@@ -2007,7 +2078,7 @@ verify_installation() {
             return 1
         }
 
-        check_disk_write "${WORKDIR}/stage1.bin" "${SYSDRIVE}" 446 "stage1" ||
+        check_disk_write "${WORKDIR}/stage1.bin" "${SYSDRIVE}" 440 "stage1" ||
             die "stage1 was not written to ${SYSDRIVE} correctly (see the hex dump just above)."
         check_disk_write "${WORKDIR}/stage2.bin" "${BIOS_BOOT_PARTITION}" \
             "$(stat -c%s "${WORKDIR}/stage2.bin" 2>/dev/null || wc -c < "${WORKDIR}/stage2.bin")" "stage2" ||
