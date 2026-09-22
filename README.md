@@ -7,7 +7,8 @@ to run. Point them at a disk, give them an SSH key, and they do the rest.
 **We recommend `alpine-install-zfs.sh`.** It's what we run in production -
 every UniDoc [Incus](https://github.com/unidoc/unidoc-aports) host is
 installed this way - specifically for the boot-environment rollback ZFS
-gives you: a bad upgrade or a bad config change is one `zfsbootmenu` boot
+gives you: a bad upgrade or a bad config change is one
+[alpine-zfsboot](https://github.com/unidoc/alpine-zfsboot) menu selection
 away from undone, which a plain ext4 root just can't offer. Reach for
 `alpine-install-normal.sh` only when you specifically need LVM, a
 non-standard partition layout, or want to avoid ZFS's operational model
@@ -16,7 +17,7 @@ non-standard partition layout, or want to avoid ZFS's operational model
 ```sh
 wget https://raw.githubusercontent.com/unidoc/alpine-installer/master/alpine-install-zfs.sh
 chmod +x alpine-install-zfs.sh
-PUBKEY="ssh-ed25519 AAAA... you@host" SYSDRIVE=/dev/sda ./alpine-install-zfs.sh
+PUBKEY="ssh-ed25519 AAAA... you@host" SYSDRIVE="/dev/sda" ./alpine-install-zfs.sh
 ```
 
 or, for a plain (non-ZFS) install:
@@ -24,7 +25,7 @@ or, for a plain (non-ZFS) install:
 ```sh
 wget https://raw.githubusercontent.com/unidoc/alpine-installer/master/alpine-install-normal.sh
 chmod +x alpine-install-normal.sh
-PUBKEY="ssh-ed25519 AAAA... you@host" SYSDRIVE=/dev/sda ./alpine-install-normal.sh
+PUBKEY="ssh-ed25519 AAAA... you@host" SYSDRIVE="/dev/sda" ./alpine-install-normal.sh
 ```
 
 **These scripts destroy all data on `SYSDRIVE` without a confirmation
@@ -43,12 +44,25 @@ script.sh`, it's `sh` trying to open a file literally named `bash`). If
 you'd rather not `chmod +x`, `bash script.sh` also works - just not
 plain `sh`.
 
+**Quote every `VAR="value"`, always - including plain words like
+`SYSDRIVE="/dev/sda"` or `USE_SERIAL="no"`.** They don't strictly need
+quotes on their own, but once you're adding several variables to one
+command line it's easy to put one `VAR="value"` *inside* another one's
+quotes by mistake - `PUBKEY="...key... USE_SERIAL="no" ...comment"`
+looks reasonable but the second `"` there just closes and reopens
+`PUBKEY`'s own quoting (bash doesn't nest double quotes), silently
+merging `USE_SERIAL="no"` into the PUBKEY value instead of setting it as
+its own variable. Quoting everything, every time, means there's only
+one pattern to follow instead of a rule about which variables "need"
+it - each `VAR="value"` stays visually self-contained and the mistake
+above becomes obvious instead of silent.
+
 ## Which one do I want?
 
 | | `alpine-install-zfs.sh` | `alpine-install-normal.sh` |
 |---|---|---|
 | Recommended | **Yes** - our own default, including for Incus hosts | Only when you have a specific reason to avoid ZFS |
-| Root filesystem | ZFS, boots via [ZFSBootMenu](https://zfsbootmenu.org) | ext4 (optionally on LVM), boots via GRUB |
+| Root filesystem | ZFS, boots via [alpine-zfsboot](https://github.com/unidoc/alpine-zfsboot) | ext4 (optionally on LVM), boots via GRUB |
 | Layout | One opinionated pool/dataset shape - not configurable | Swap on/off, LVM on/off, or bring your own partitioning (`SKIP_PARTITIONING=yes`) |
 | Snapshots/rollback | Yes (that's the point of ZFS here) | No |
 | Best for | Production installs, especially Incus/virtualization hosts | LVM, a custom partition layout, or deliberately avoiding ZFS |
@@ -109,13 +123,38 @@ you need to override, run the script, nothing to edit. Both scripts:
 | `SYSHOSTNAME` | `alpine` | Hostname |
 | `ALPINE_VERSION` | *(auto-detected)* | Pin a specific Alpine release |
 | `USE_UEFI` | `auto` | `auto`/`yes`/`no` - detects `/sys/firmware/efi` |
-| `USE_SERIAL` | `auto` | `auto`/`yes`/`no` - `auto` checks the rescue system's own kernel command line for `console=ttyS0`/`console=ttyAMA0` (see `detect_serial()`) rather than the live tty, since an SSH session into the rescue system says nothing about what will actually be available to reach ZFSBootMenu after reboot |
+| `USE_SERIAL` | `auto` | `auto`/`yes`/`no` - `auto` checks the rescue system's own kernel command line for `console=ttyS0`/`console=ttyAMA0` (see `detect_serial()`) rather than the live tty, since an SSH session into the rescue system says nothing about what will actually be available to reach alpine-zfsboot's own menu after reboot |
 | `SWAP_SIZE_GIB` | `2` (zfs) / `0` (normal) | Swap partition size; `0` disables it |
 | `VIRT` | `auto` | `auto`/`yes`/`no` - `yes` installs `linux-virt`, `no` installs `linux-lts`. `auto` guesses from a CPUID hypervisor flag, an ARM hypervisor device-tree node, and DMI vendor strings (see `detect_virt()`) - a heuristic, not a certainty; force it if you already know |
 
 `alpine-install-zfs.sh` also has `POOL_NAME` (documented inline above its
-declaration in the script) and the `ZBM_*` overrides - see "ZFSBootMenu
-artifacts" below.
+declaration in the script) and the variables below - see "alpine-zfsboot
+artifacts" for the `ALPINE_ZFSBOOT_EFI_*`/`ALPINE_ZFSBOOT_BIOS_*` boot
+artifact overrides.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DISK_LAYOUT` | `gpt` | `gpt`/`msdos` - legacy BIOS mode's disk-partitioning scheme (`USE_UEFI=no` only; there is no msdos+UEFI path, UEFI firmware needs GPT+ESP). Both are real, first-class layouts - alpine-zfsboot's own boot code auto-detects which is on disk at boot time |
+| `ENCRYPT_ZROOT` | `no` | `yes` makes the ZFS `ROOT` container itself the encryption root (`aes-256-gcm`, one passphrase) - every boot environment, current and future, inherits it automatically. Requires `ZROOT_PASSPHRASE` |
+| `ZROOT_PASSPHRASE` | *(empty)* | Required when `ENCRYPT_ZROOT=yes`. Never put this on a command line - export it |
+
+**Per-machine rescue SSH/network settings** - **UEFI only** (legacy BIOS
+mode creates no ESP at all to persist these to; the installer refuses to
+start if any of these are set together with `USE_UEFI=no`). Written to
+`/EFI/alpine-zfsboot/` on the ESP for alpine-zfsboot's own `/init` to read
+at every boot - all optional, nothing here is required for a plain,
+non-rescue install:
+
+| Variable | Meaning |
+|---|---|
+| `ALPINE_ZFSBOOT_SSH_KEY` | One or more (newline-separated) raw SSH public key lines, written verbatim as `authorized_keys` for alpine-zfsboot's own rescue SSH. Setting this is what actually turns rescue SSH on - everything below is meaningless without it |
+| `ALPINE_ZFSBOOT_NET` | `dhcp`/`static` - default network mode for both families (per-family below overrides it) |
+| `ALPINE_ZFSBOOT_IPV4` / `ALPINE_ZFSBOOT_IPV6` | `off`/`dhcp`/`static` - per-family override |
+| `ALPINE_ZFSBOOT_IPV4_ADDRESS` / `ALPINE_ZFSBOOT_IPV6_ADDRESS` | Static address (CIDR) for that family |
+| `ALPINE_ZFSBOOT_IPV4_GATEWAY` / `ALPINE_ZFSBOOT_IPV6_GATEWAY` | Static gateway for that family |
+| `ALPINE_ZFSBOOT_SSH_LISTEN` | Bind address override for rescue SSH |
+| `ALPINE_ZFSBOOT_SSH_PORT` | Port override for rescue SSH |
+| `ALPINE_ZFSBOOT_SSH_ALLOW` | Source-CIDR allowlist for rescue SSH (default-deny otherwise) |
 
 `alpine-install-normal.sh` also has:
 
@@ -130,96 +169,49 @@ artifacts" below.
 felt like solving a problem nobody has when "just partition it yourself
 and hand the script the device path" already works.
 
-## ZFSBootMenu artifacts
+## alpine-zfsboot artifacts
 
-`alpine-install-zfs.sh` needs a ZFSBootMenu boot image. We build all of
-them ourselves - separate VGA and serial EFI images for x86_64, a
-console-only EFI image for aarch64, plus the BIOS Components pair - and
-publish them as
-[GitHub Releases](https://github.com/unidoc/alpine-installer/releases) on
-this repo (`.github/workflows/build-zbm-images.yml`, manual dispatch
-only - deliberately no schedule, since these get baked directly into
-installed systems' boot process with no PR/review gate in between; an
-automatic rebuild would silently change what
-`releases/latest/download/...` resolves to for anyone installing
-afterward). Not GitHub Pages, not `unidoc-aports` (these are boot
-binaries, not Alpine packages, a genuinely different artifact shape).
-Every case below has a working default out of the box - no override
-needed:
+`alpine-install-zfs.sh` needs alpine-zfsboot's own boot artifacts -
+[alpine-zfsboot](https://github.com/unidoc/alpine-zfsboot) publishes and
+builds these itself now (a separate project with its own release
+pipeline), not something this repo builds or hosts. Every default below
+resolves against `releases/latest/download/...` on that repo - asset
+filenames are arch-based and unversioned by design there, so a new
+alpine-zfsboot release just works with no change needed here.
 
-| Case | Default source |
+UEFI mode fetches one file - alpine-zfsboot's own self-contained `.EFI`
+(kernel+initramfs+cmdline all bundled):
+
+| Variable | Default |
 |---|---|
-| x86_64, UEFI, VGA (`USE_SERIAL=no`, default) | Built by us |
-| x86_64, UEFI, serial (`USE_SERIAL=yes`) | Built by us |
-| aarch64, UEFI, VGA (`USE_SERIAL=no`, default) | Built by us |
-| aarch64, UEFI, serial (`USE_SERIAL=yes`) | Built by us |
-| x86_64, legacy BIOS (Components: kernel+initramfs) | Built by us |
+| `ALPINE_ZFSBOOT_EFI_X86_64_URL` | `alpine-zfsboot-x86_64.EFI` from the latest release |
+| `ALPINE_ZFSBOOT_EFI_AARCH64_URL` | `alpine-zfsboot-aarch64.EFI` from the latest release |
+| `ALPINE_ZFSBOOT_EFI_URL` / `ALPINE_ZFSBOOT_EFI_FILE` | Override the resolved URL, or point at a local file instead (skips downloading) |
 
-**A single combined image (both `console=` entries baked into one
-kernel command line) was tried first, and confirmed broken in
-practice.** The kernel does send boot messages to every `console=`
-listed, but only the LAST one becomes `/dev/console` - and that's the
-only one ZFSBootMenu's interactive menu actually attaches to. A real
-install showed the menu on the primary console and nothing but boot log
-on the other - not good enough for a boot-critical tool where you might
-only have one of the two available. Two images per arch costs nothing
-extra to build, so that's the default now.
+Legacy BIOS mode (x86_64 only) fetches three: `stage1` (the
+protective-MBR boot sector), `stage2` (GPT/MBR-parsing + Linux
+boot-protocol code), and the boot blob (kernel+initrd+cmdline, packed
+by alpine-zfsboot's own build):
 
-Point `ZBM_EFI_URL`/`ZBM_VMLINUZ_URL`/`ZBM_INITRAMFS_URL` (or the
-`_FILE` variants) at your own image instead, if you'd rather not use
-ours - e.g. ZFSBootMenu's own official `https://get.zfsbootmenu.org/efi`
-for a stock x86_64 UEFI VGA-only image.
+| Variable | Default |
+|---|---|
+| `ALPINE_ZFSBOOT_BIOS_STAGE1_URL` | `alpine-zfsboot-x86_64-bios-stage1.bin` |
+| `ALPINE_ZFSBOOT_BIOS_STAGE2_URL` | `alpine-zfsboot-x86_64-bios-stage2.bin` |
+| `ALPINE_ZFSBOOT_BIOS_BOOTBLOB_URL` | `alpine-zfsboot-x86_64-bios-bootblob.img` |
+| `ALPINE_ZFSBOOT_BIOS_STAGE1_FILE` / `_STAGE2_FILE` / `_BOOTBLOB_FILE` | Same local-file overrides as `_EFI_FILE` above, one per artifact |
 
-- **x86_64** uses ZFSBootMenu's own official builder container
-  (`ghcr.io/zbm-dev/zbm-builder`, pinned to a dated tag) - same
-  mechanism as their own official release build.
-- **aarch64** has no pre-built builder container (confirmed amd64-only
-  by inspecting its image manifest) and no aarch64 path in upstream's
-  own CI at all, so there was nothing to just reuse. Instead, the
-  workflow checks out ZFSBootMenu's source (pinned to a tag, no fork
-  needed - see below) and builds the builder image itself, natively, on
-  a real arm64 GitHub-hosted runner (`ubuntu-24.04-arm`) - no
-  cross-compilation. That distinction is load-bearing: an earlier,
-  separate attempt at this exact build cross-compiled the builder image
-  for arm64 from amd64 hardware via `docker buildx --platform
-  linux/arm64`, which was impractically slow, because Void Linux's `zfs`
-  package triggers a real DKMS/gcc compile of the OpenZFS kernel module
-  and QEMU user-mode emulation makes that painful. A native arm64
-  runner has no such penalty.
-
-**No zfsbootmenu fork needed.** Both jobs apply the same fix (see next
-paragraph) as one extra `dracut.conf.d` file, written fresh in CI every
-run rather than maintained as a patch against a cloned/forked source
-tree - it's purely additive config, not a code change to the generator,
-so it survives `ZFSBOOTMENU_REF` version bumps with zero drift risk
-instead of needing to be manually rebased each time upstream moves.
-
-**The console/zfs-module fix.** Building via a container (rather than
-on real target hardware) runs ZFSBootMenu's dracut module in
-generic/non-hostonly mode, which hits two real bugs neither job would
-work without:
-
-1. Upstream's own `omit-drivers.conf` blanket-omits `drm` (the
-   rationale - real GPU hardware rarely reinitializes after a `kexec` -
-   doesn't apply here: ZBM boots directly via EFI, no kexec involved).
-   On a KVM/QEMU virtual machine (`virtio_gpu`), that omission is a
-   black screen, not a missing feature - the shared `drm` core is what
-   brings up any console at all.
-2. ZFSBootMenu's own dracut module calls `instmods -c` for zfs/spl/etc
-   as its "essential modules" check, but in a generic build that check
-   silently does not copy the `.ko` files into the image - no build
-   error, just a ZFSBootMenu that can never import a pool.
-
-Both are fixed by one small `force_drivers`/`omit_drivers` override
-(see the workflow for the exact file). Neither bug is aarch64-specific -
-they were originally found while debugging ZFSBootMenu on an aarch64 KVM
-VM, but they apply identically on x86_64 KVM/virtio_gpu targets, which
-is exactly what most cloud/VPS installs are.
+`ALPINE_ZFSBOOT_CHECKSUMS_URL` defaults to that same release's own
+`SHA256SUMS` - every downloaded artifact is checked against it
+(`verify_zfsboot_checksum()`); a custom `*_URL` pointing somewhere this
+project doesn't control just skips verification with a warning, since
+there's no entry to check it against either way.
 
 ## What these scripts don't do
 
 - Ask you anything interactively. Everything is an env var; there's no
   wizard, no confirmation prompt before the disk gets wiped.
-- Support disk encryption, multi-disk arrays, or network installs.
+- Support multi-disk arrays or network installs. (`alpine-install-zfs.sh`
+  does support ZFS-native root encryption - see `ENCRYPT_ZROOT` above;
+  `alpine-install-normal.sh` has no encryption option at all.)
 - Manage anything after the first boot - once Alpine is up, it's just
   Alpine.
