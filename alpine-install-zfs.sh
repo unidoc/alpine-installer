@@ -1693,6 +1693,27 @@ rc-update add alpine-zfsboot-bootcheck default
 
 echo button >> /etc/modules
 
+# vfat is a loadable module on Alpine's own linux-virt/linux-lts kernels,
+# not built in - confirmed the hard way on a real running host: apk
+# upgrade had already deleted /lib/modules/<old-running-kernel>/ (Alpine
+# only keeps the modules for the CURRENTLY INSTALLED kernel package, not
+# the one still actually running until the next reboot), so a later
+# \`mount /boot/efi\` on that same still-running-old-kernel boot failed
+# with "No such device" - modprobe vfat had nowhere left to load it
+# from. Loading it once here, unconditionally at THIS boot (while this
+# kernel's own modules are still guaranteed present, since this script
+# runs inside the freshly-installed chroot before any upgrade could ever
+# remove them), keeps it resident in memory for the rest of that boot's
+# uptime regardless of what a future \`apk upgrade\` later does to the
+# on-disk module directory - same reasoning as the button module above,
+# and the same real gap format_boot_partition()'s own \`modprobe vfat\`
+# call already works around during install, just persisted past install
+# time too now. UEFI only - legacy BIOS mode has no vfat filesystem
+# anywhere on the disk at all (see this file's own disk-layout comment).
+if [ "${USE_UEFI}" != "no" ]; then
+    echo vfat >> /etc/modules
+fi
+
 # Last Boot Diagnostics - OpenRC's own stock service logger
 # (rc_logger="YES" in /etc/rc.conf, default rc_log_path=/var/log/rc.log)
 # writes every service's start/stop output there, including the exact

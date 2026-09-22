@@ -853,6 +853,25 @@ rc-update add sshd default
 
 echo button >> /etc/modules
 
+# vfat is a loadable module on Alpine's own linux-virt/linux-lts kernels,
+# not built in - confirmed the hard way on a real running host: apk
+# upgrade had already deleted /lib/modules/<old-running-kernel>/ (Alpine
+# only keeps the modules for the CURRENTLY INSTALLED kernel package, not
+# the one still actually running until the next reboot), so a later
+# \`mount /boot/efi\` on that same still-running-old-kernel boot failed
+# with "No such device" - modprobe vfat had nowhere left to load it
+# from. Loading it once here, unconditionally at THIS boot (while this
+# kernel's own modules are still guaranteed present, since this script
+# runs inside the freshly-installed chroot before any upgrade could ever
+# remove them), keeps it resident in memory for the rest of that boot's
+# uptime regardless of what a future \`apk upgrade\` later does to the
+# on-disk module directory. UEFI only - legacy BIOS mode (GRUB installs
+# straight to the disk's own boot sector) has no vfat filesystem
+# anywhere on the disk at all.
+if [ "${USE_UEFI}" != "no" ]; then
+    echo vfat >> /etc/modules
+fi
+
 setup-timezone UTC
 
 # Root's password is deliberately left EMPTY, not set and not locked -
