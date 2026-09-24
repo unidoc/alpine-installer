@@ -138,12 +138,14 @@ artifact overrides.
 | `ENCRYPT_ZROOT` | `no` | `yes` makes the ZFS `ROOT` container itself the encryption root (`aes-256-gcm`, one passphrase) - every boot environment, current and future, inherits it automatically. Requires `ZROOT_PASSPHRASE` |
 | `ZROOT_PASSPHRASE` | *(empty)* | Required when `ENCRYPT_ZROOT=yes`. Never put this on a command line - export it |
 
-**Per-machine rescue SSH/network settings** - **UEFI only** (legacy BIOS
-mode creates no ESP at all to persist these to; the installer refuses to
-start if any of these are set together with `USE_UEFI=no`). Written to
-`/EFI/alpine-zfsboot/` on the ESP for alpine-zfsboot's own `/init` to read
-at every boot - all optional, nothing here is required for a plain,
-non-rescue install:
+**Per-machine rescue SSH/network settings** - available on every layout
+(UEFI, legacy BIOS/GPT, and legacy BIOS/msdos alike: alpine-zfsboot's own
+unified storage architecture means every install carries the same
+canonical FAT/ESP partition, not just UEFI ones). Written to
+`/EFI/ALPINE/` on that partition for alpine-zfsboot's own `/init`
+to read at every boot, regardless of which firmware path got the kernel
+running - all optional, nothing here is required for a plain, non-rescue
+install:
 
 | Variable | Meaning |
 |---|---|
@@ -188,23 +190,60 @@ UEFI mode fetches one file - alpine-zfsboot's own self-contained `.EFI`
 | `ALPINE_ZFSBOOT_EFI_AARCH64_URL` | `alpine-zfsboot-aarch64.EFI` from the latest release |
 | `ALPINE_ZFSBOOT_EFI_URL` / `ALPINE_ZFSBOOT_EFI_FILE` | Override the resolved URL, or point at a local file instead (skips downloading) |
 
-Legacy BIOS mode (x86_64 only) fetches three: `stage1` (the
-protective-MBR boot sector), `stage2` (GPT/MBR-parsing + Linux
-boot-protocol code), and the boot blob (kernel+initrd+cmdline, packed
-by alpine-zfsboot's own build):
+Legacy BIOS mode (x86_64 only) fetches five: `stage1` (the
+protective-MBR boot sector), `stage2` (GPT/MBR-parsing + a minimal
+read-only FAT32 reader + Linux boot-protocol code), and the same loose
+`kernel`/`initrd`/`cmdline` files UEFI mode's own `.EFI` already bundles -
+copied onto the canonical FAT/ESP partition as ordinary files
+(`EFI/ALPINE/{KERNEL,INITRD,CMDLINE}`), not packed into a separate format:
 
 | Variable | Default |
 |---|---|
 | `ALPINE_ZFSBOOT_BIOS_STAGE1_URL` | `alpine-zfsboot-x86_64-bios-stage1.bin` |
 | `ALPINE_ZFSBOOT_BIOS_STAGE2_URL` | `alpine-zfsboot-x86_64-bios-stage2.bin` |
-| `ALPINE_ZFSBOOT_BIOS_BOOTBLOB_URL` | `alpine-zfsboot-x86_64-bios-bootblob.img` |
-| `ALPINE_ZFSBOOT_BIOS_STAGE1_FILE` / `_STAGE2_FILE` / `_BOOTBLOB_FILE` | Same local-file overrides as `_EFI_FILE` above, one per artifact |
+| `ALPINE_ZFSBOOT_BIOS_KERNEL_URL` | `alpine-zfsboot-x86_64-vmlinuz` |
+| `ALPINE_ZFSBOOT_BIOS_INITRD_URL` | `alpine-zfsboot-x86_64-initramfs.img` |
+| `ALPINE_ZFSBOOT_BIOS_CMDLINE_URL` | `alpine-zfsboot-x86_64-cmdline.txt` |
+| `ALPINE_ZFSBOOT_BIOS_STAGE1_FILE` / `_STAGE2_FILE` / `_KERNEL_FILE` / `_INITRD_FILE` / `_CMDLINE_FILE` | Same local-file overrides as `_EFI_FILE` above, one per artifact |
 
 `ALPINE_ZFSBOOT_CHECKSUMS_URL` defaults to that same release's own
 `SHA256SUMS` - every downloaded artifact is checked against it
 (`verify_zfsboot_checksum()`); a custom `*_URL` pointing somewhere this
 project doesn't control just skips verification with a warning, since
 there's no entry to check it against either way.
+
+Every default `*_URL` above (never a custom one you've set) is also
+pinned to ONE resolved release tag before anything is fetched
+(`pin_zfsboot_release_urls()`, called from `fetch_zfsboot_artifacts()`)
+- a single GitHub API lookup shared across every artifact this run
+actually needs, rather than each one independently resolving
+`releases/latest/download/...` on its own. Without this, a new
+alpine-zfsboot release published mid-install could - in principle -
+have left different artifacts (and the checksums file itself) coming
+from two different releases, each individually checksum-verified but
+never cross-checked against each other. A local `*_FILE` override
+never touches the network at all and is unaffected.
+
+One more thing this script depends on, regardless of firmware:
+`alpine-zfsboot` itself (`cmd/tool` in that repo) - the CLI that now owns
+writing/verifying every boot artifact above. This installer no longer
+implements stage1/stage2/EFI-loader/FAT-payload/config writing itself; it
+runs `alpine-zfsboot install` (`dd` at a fixed LBA is that command's own
+implementation detail now, not something this script - or an
+administrator - does by hand).
+
+Unlike every other artifact above, this is **not** fetched from GitHub at
+install time - it's a required system command, exactly like `sgdisk` or
+`dropbear` (see `apk_package_for_command()`/`require_command()`): install
+it ahead of time with `apk add alpine-zfsboot` (already packaged in
+`unidoc-aports`), and this script just calls it by name. If it's genuinely
+missing, `require_command()`'s own `apk add` fallback installs it
+automatically, same as any other required command.
+
+Once installed, the same binary is the ongoing management interface for
+that machine's own alpine-zfsboot boot environment - `alpine-zfsboot
+status`/`verify`/`update`, run directly on the target, firmware detected
+automatically (see that repo's own README).
 
 ## What these scripts don't do
 

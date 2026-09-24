@@ -19,12 +19,24 @@
 #     not cover
 #
 # Disk layout:
+#   alpine-zfsboot's own unified storage architecture: EVERY layout below
+#   (UEFI/GPT, BIOS/GPT, BIOS/msdos) carries the SAME canonical, 512 MiB
+#   FAT/ESP partition (EFI_PARTITION) - one persistent boot-store format,
+#   not one for UEFI and a separate one for BIOS. UEFI firmware loads
+#   alpine-zfsboot's own self-contained .EFI (kernel+initramfs+cmdline all
+#   bundled into one file - see the alpine-zfsboot repo's build.sh) from it
+#   directly, at the standard removable-media fallback path (no NVRAM boot
+#   entry needed); BIOS mode's stage2 loads the SAME kernel/initramfs/
+#   cmdline as ordinary files (EFI/ALPINE/{KERNEL,INITRD,CMDLINE}) off the
+#   SAME partition, via its own small, read-only FAT32 reader
+#   (alpine-zfsboot's bios/fat.c). Per-machine rescue-SSH/network config
+#   (EFI/ALPINE/{config,authorized_keys,ssh_host_ed25519_key}) lives
+#   there too, read by alpine-zfsboot's own /init after boot regardless of
+#   which firmware path got the kernel running - this is exactly what
+#   closes the "rescue SSH only works in UEFI mode" gap an earlier version
+#   of this project had.
 #   UEFI mode:
-#     1: 512 MiB EFI System Partition - holds alpine-zfsboot's own
-#        self-contained .EFI (kernel+initramfs+cmdline all bundled into one
-#        file - see the alpine-zfsboot repo's build.sh) at the standard
-#        removable-media fallback path, so any UEFI firmware finds it with no
-#        NVRAM boot entry needed.
+#     1: 512 MiB EFI System Partition (as above)
 #     2: swap (SWAP_SIZE_GIB, default 2 GiB - set to 0 to skip it entirely)
 #     3: remaining space for ZFS
 #   BIOS mode (USE_UEFI=no):
@@ -35,35 +47,32 @@
 #        does a raw, unconditional fixed-LBA read here with no GPT parsing at
 #        all, so this partition's start position is a hard, load-bearing
 #        build-time invariant, not a convention this script can freely
-#        rearrange. Holds stage2 (real GPT-parsing + Linux boot-protocol
-#        code).
-#     2: alpine-zfsboot's own "boot blob" (header + kernel + initrd +
-#        cmdline, packed by its own build.sh) - a dedicated GPT partition
-#        found by TYPE GUID (not position - see gpt.h in the alpine-zfsboot
-#        repo), sized to the actual downloaded bootblob file plus a little
-#        headroom.
+#        rearrange. Holds stage2 (real GPT/MBR-parsing + FAT32 reader +
+#        Linux boot-protocol code).
+#     2: the SAME canonical FAT/ESP partition described above - found by
+#        GPT type GUID EF00 (the real, standard EFI System Partition type -
+#        the exact same one the UEFI branch's own EFI_PARTITION uses, not a
+#        project-specific one), not by position.
 #     3: swap (SWAP_SIZE_GIB, default 2 GiB - set to 0 to skip it entirely)
 #     4: remaining space for ZFS
-#     No EFI System Partition at all in this mode - alpine-zfsboot's BIOS
-#     path has no filesystem code whatsoever, only raw sector reads, so
-#     there's nothing here that would ever read one.
 #   BIOS mode, DISK_LAYOUT=msdos (also USE_UEFI=no - see DISK_LAYOUT's own
 #   comment): the SAME two BIOS-only entries above, on a classic 4-primary-
 #   partition MBR/msdos partition table (via sfdisk) instead of GPT (via
 #   sgdisk) - alpine-zfsboot's own stage2 auto-detects which one is
 #   actually on the disk at real boot time (see bios/stage2_main.c/mbr.h in
-#   that repo) and finds the boot-blob the matching way either way, so this
-#   is a second, real, equally-supported target, not a degraded fallback:
+#   that repo) and finds the FAT partition the matching way either way, so
+#   this is a second, real, equally-supported target, not a degraded
+#   fallback:
 #     1: stage2, at the SAME fixed LBA 34 stage1.S always reads regardless
 #        of partitioning scheme - given a REAL, typed (but functionally
 #        unread-by-any-code - see ALPINE_ZFSBOOT_STAGE2_MBR_TYPE's own
 #        comment) primary partition entry here too, purely so it's visible
 #        to `fdisk -l`/`sfdisk -d` instead of sitting in a partition-table-
 #        invisible gap.
-#     2: boot blob - found by MBR partition TYPE BYTE this time (not GPT
-#        type GUID - see ALPINE_ZFSBOOT_BOOTBLOB_MBR_TYPE, and bios/mbr.h's
-#        own mbr_find_partition()), same file, same packing, same sizing
-#        as the GPT case.
+#     2: the canonical FAT/ESP partition - found by MBR partition TYPE BYTE
+#        this time (not GPT type GUID - see ALPINE_ZFSBOOT_FAT_MBR_TYPE, and
+#        bios/mbr.h's own mbr_find_partition()), same fixed 512 MiB size as
+#        the GPT case.
 #     3: swap
 #     4: remaining space for ZFS
 #   Exactly 4 primary partitions, deliberately - a classic MBR has room for
@@ -174,7 +183,7 @@ USE_UEFI="${USE_UEFI:-auto}"
 # alpine-zfsboot's own stage2 (see the repo's bios/stage2_main.c) already
 # auto-detects which of the two is actually on the disk at real boot time
 # (a valid GPT header at LBA 1, or else a classic MBR partition table) and
-# finds the boot-blob partition the matching way either way - see
+# finds the canonical FAT/ESP partition the matching way either way - see
 # bios/mbr.h's own header comment for the full design reasoning. This
 # variable only controls which one THIS install actually WRITES; nothing
 # here is a fallback for the other at runtime, both are real, supported,
@@ -213,8 +222,9 @@ ENCRYPT_ZROOT="${ENCRYPT_ZROOT:-no}"
 ZROOT_PASSPHRASE="${ZROOT_PASSPHRASE:-}"
 
 # Per-machine alpine-zfsboot rescue/network settings, persisted to the
-# ESP (/EFI/alpine-zfsboot/ - see write_alpine_zfsboot_esp_config()
-# below) rather than baked into the .EFI binary itself: EXTRA_CMDLINE
+# ESP (/EFI/ALPINE/ - via `alpine-zfsboot install`'s own --ssh-key/--net/
+# etc flags, see zfsboot_config_args() below) rather than baked into the
+# .EFI binary itself: EXTRA_CMDLINE
 # (see alpine-zfsboot's own build.sh) is build-time only, and this
 # project ships ONE generic .EFI shared across an entire fleet, not a
 # per-machine artifact - a compiled-in key would mean rebuilding and
@@ -228,7 +238,7 @@ ZROOT_PASSPHRASE="${ZROOT_PASSPHRASE:-}"
 # UEFI ONLY. There is no ESP at all in legacy BIOS mode (USE_UEFI=no) -
 # alpine-zfsboot's own /init reads this material from exactly one
 # place, a vfat filesystem labelled EFI carrying
-# /EFI/alpine-zfsboot/{config,authorized_keys,ssh_host_ed25519_key},
+# /EFI/ALPINE/{config,authorized_keys,ssh_host_ed25519_key},
 # and BIOS mode's own disk layout never creates one (see this file's
 # own disk-layout comment). validate_environment() dies if any of
 # these are set together with USE_UEFI=no, rather than silently
@@ -239,7 +249,7 @@ ZROOT_PASSPHRASE="${ZROOT_PASSPHRASE:-}"
 # rule above - it has no alpine-zfsboot.* cmdline equivalent at all.
 # Takes a RAW pubkey line (or several, newline-separated, exactly like
 # PUBKEY above) and this installer writes it verbatim as
-# /EFI/alpine-zfsboot/authorized_keys - one BARE key per line, no
+# /EFI/ALPINE/authorized_keys - one BARE key per line, no
 # base64, no invented config-key representation, but also NOT full
 # OpenSSH authorized_keys syntax: /init only ever accepts a line that
 # starts directly with a known key type, so operator-supplied options
@@ -249,8 +259,8 @@ ZROOT_PASSPHRASE="${ZROOT_PASSPHRASE:-}"
 # an earlier version of this DID have a
 # alpine-zfsboot.ssh_key=<base64 pubkey> cmdline/config key, removed in
 # favor of this plain file once a real hardware test motivated it).
-# write_alpine_zfsboot_esp_config() also generates this machine's own
-# persistent /EFI/alpine-zfsboot/ssh_host_ed25519_key alongside it,
+# `alpine-zfsboot install` (via --ssh-key) also generates this machine's
+# own persistent /EFI/ALPINE/ssh_host_ed25519_key alongside it,
 # whenever this variable is set.
 ALPINE_ZFSBOOT_SSH_KEY="${ALPINE_ZFSBOOT_SSH_KEY:-}"
 ALPINE_ZFSBOOT_NET="${ALPINE_ZFSBOOT_NET:-}"
@@ -281,17 +291,25 @@ ALPINE_ZFSBOOT_EFI_AARCH64_URL="${ALPINE_ZFSBOOT_EFI_AARCH64_URL:-https://github
 ALPINE_ZFSBOOT_EFI_URL="${ALPINE_ZFSBOOT_EFI_URL:-}"
 ALPINE_ZFSBOOT_EFI_FILE="${ALPINE_ZFSBOOT_EFI_FILE:-}"
 
-# BIOS mode (x86_64 only): stage1 (the protective-MBR boot sector), stage2
-# (real GPT-parsing + Linux boot-protocol code), and the boot blob (kernel +
-# initramfs + cmdline, packed by alpine-zfsboot's own build.sh). See this
-# file's own disk-layout comment above for how each of these actually gets
-# placed on disk.
+# BIOS mode (x86_64 only): stage1 (the protective-MBR boot sector) and
+# stage2 (real GPT/MBR-parsing + a minimal read-only FAT32 reader + Linux
+# boot-protocol code - see alpine-zfsboot's own bios/fat.c). No separate
+# "boot blob" artifact any more: stage2 reads the kernel/initramfs/cmdline
+# straight off the canonical alpine-zfsboot FAT/ESP partition, as ordinary
+# files - the SAME loose files alpine-zfsboot's build.sh already produces
+# for GRUB-chainload use, fetched here too and copied onto that partition
+# by install_alpine_zfsboot_bios() below. See this file's own disk-layout
+# comment above for how each of these actually gets placed on disk.
 ALPINE_ZFSBOOT_BIOS_STAGE1_URL="${ALPINE_ZFSBOOT_BIOS_STAGE1_URL:-https://github.com/unidoc/alpine-zfsboot/releases/latest/download/alpine-zfsboot-x86_64-bios-stage1.bin}"
 ALPINE_ZFSBOOT_BIOS_STAGE2_URL="${ALPINE_ZFSBOOT_BIOS_STAGE2_URL:-https://github.com/unidoc/alpine-zfsboot/releases/latest/download/alpine-zfsboot-x86_64-bios-stage2.bin}"
-ALPINE_ZFSBOOT_BIOS_BOOTBLOB_URL="${ALPINE_ZFSBOOT_BIOS_BOOTBLOB_URL:-https://github.com/unidoc/alpine-zfsboot/releases/latest/download/alpine-zfsboot-x86_64-bios-bootblob.img}"
+ALPINE_ZFSBOOT_BIOS_KERNEL_URL="${ALPINE_ZFSBOOT_BIOS_KERNEL_URL:-https://github.com/unidoc/alpine-zfsboot/releases/latest/download/alpine-zfsboot-x86_64-vmlinuz}"
+ALPINE_ZFSBOOT_BIOS_INITRD_URL="${ALPINE_ZFSBOOT_BIOS_INITRD_URL:-https://github.com/unidoc/alpine-zfsboot/releases/latest/download/alpine-zfsboot-x86_64-initramfs.img}"
+ALPINE_ZFSBOOT_BIOS_CMDLINE_URL="${ALPINE_ZFSBOOT_BIOS_CMDLINE_URL:-https://github.com/unidoc/alpine-zfsboot/releases/latest/download/alpine-zfsboot-x86_64-cmdline.txt}"
 ALPINE_ZFSBOOT_BIOS_STAGE1_FILE="${ALPINE_ZFSBOOT_BIOS_STAGE1_FILE:-}"
 ALPINE_ZFSBOOT_BIOS_STAGE2_FILE="${ALPINE_ZFSBOOT_BIOS_STAGE2_FILE:-}"
-ALPINE_ZFSBOOT_BIOS_BOOTBLOB_FILE="${ALPINE_ZFSBOOT_BIOS_BOOTBLOB_FILE:-}"
+ALPINE_ZFSBOOT_BIOS_KERNEL_FILE="${ALPINE_ZFSBOOT_BIOS_KERNEL_FILE:-}"
+ALPINE_ZFSBOOT_BIOS_INITRD_FILE="${ALPINE_ZFSBOOT_BIOS_INITRD_FILE:-}"
+ALPINE_ZFSBOOT_BIOS_CMDLINE_FILE="${ALPINE_ZFSBOOT_BIOS_CMDLINE_FILE:-}"
 
 # Checked the same way the Alpine rootfs itself is (fetch_rootfs()); a
 # missing/unreachable checksums file only skips verification with a
@@ -300,14 +318,29 @@ ALPINE_ZFSBOOT_BIOS_BOOTBLOB_FILE="${ALPINE_ZFSBOOT_BIOS_BOOTBLOB_FILE:-}"
 # entry to check against either way.
 ALPINE_ZFSBOOT_CHECKSUMS_URL="${ALPINE_ZFSBOOT_CHECKSUMS_URL:-https://github.com/unidoc/alpine-zfsboot/releases/latest/download/SHA256SUMS}"
 
+# The alpine-zfsboot CLI itself (cmd/tool in that repo) - the authoritative
+# writer/verifier of every boot artifact below. This installer no longer
+# implements stage1/stage2/EFI-loader/FAT-payload/config writing itself; it
+# calls `alpine-zfsboot install` (see install_alpine_zfsboot_bios()/
+# install_alpine_zfsboot_uefi()) - one authoritative implementation of the
+# on-disk boot ABI, not two. NOT fetched from GitHub at install time - the
+# org's own stated practice is `apk add alpine-zfsboot` (from unidoc-aports,
+# already carrying its own package) ahead of time, same as every other
+# required system command (sgdisk, dropbear, ...) - see require_command's
+# own apk_package_for_command() mapping. If it's ever genuinely missing,
+# require_command's own auto-`apk add` fallback handles it the same way.
+
 ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
 
-# alpine-zfsboot's own "boot blob" partition type GUID (bios/gpt.h in that
-# repo) - a real, freshly generated random UUID specific to this project,
-# not the standard "BIOS boot partition" type code (that one's used below
-# too, for the SEPARATE stage1/stage2 partition - see
-# ALPINE_ZFSBOOT_BIOS_BOOT_GUID).
-ALPINE_ZFSBOOT_BOOTBLOB_GUID="f5bd658b-eee4-402f-be5b-d939c082b649"
+# BIOS+GPT's FAT/ESP partition uses the SAME "EF00" sgdisk type code as
+# UEFI's own EFI_PARTITION below (the real, standard EFI System Partition
+# type GUID, C12A7328-F81F-11D2-BA4B-00A0C93EC93B) - alpine-zfsboot's own
+# unified storage architecture: one partition identity, one FAT filesystem,
+# both firmware paths. No project-specific GUID needed here any more (an
+# earlier version of this project used a freshly-generated random UUID to
+# identify a filesystem-less "boot blob" partition format that no longer
+# exists - see git history, not this file, for that).
+#
 # The standard GPT "BIOS boot partition" type code - alpine-zfsboot's
 # stage1/stage2 don't NEED this specific type code (stage1 finds this
 # partition by fixed LBA, never by GPT type lookup at all - see this
@@ -316,25 +349,27 @@ ALPINE_ZFSBOOT_BOOTBLOB_GUID="f5bd658b-eee4-402f-be5b-d939c082b649"
 # recognizes it (gdisk, parted, ...) shows this partition's purpose
 # correctly instead of as a bare unknown GUID.
 ALPINE_ZFSBOOT_BIOS_BOOT_GUID="21686148-6449-6E6F-744E-656564454649"
-# The two msdos/MBR-mode equivalents of the two GUIDs just above - only
-# used when DISK_LAYOUT=msdos. ALPINE_ZFSBOOT_BOOTBLOB_MBR_TYPE MUST match
-# bios/mbr.h's own ZFSBOOT_BOOTBLOB_MBR_TYPE exactly (0x2E) - that's the
-# one real, load-bearing invariant here: stage2's own mbr_find_partition()
-# call (see bios/stage2_main.c) scans the disk's MBR partition table for
-# exactly this type byte to find the boot-blob, the MBR equivalent of
-# ALPINE_ZFSBOOT_BOOTBLOB_GUID above for GPT. ALPINE_ZFSBOOT_STAGE2_MBR_TYPE,
-# by contrast, is NOT read by any code at all (same as
-# ALPINE_ZFSBOOT_BIOS_BOOT_GUID above, which stage1.S also never looks
-# up - it just reads a fixed LBA) - it exists purely so the stage2
-# partition shows up as a real, typed, visible entry in the msdos
-# partition table (`fdisk -l`, `sfdisk -d`, ...) instead of occupying an
-# implicit, tool-invisible gap that only this project's own code and
-# documentation would know about. Picked from the same kind of
-# unassigned-by-convention byte range as the bootblob's own 0x2E (see
-# that file's own comment for why: not one of the many already-assigned
-# classic MBR type codes like 0x83 Linux/0x82 swap/0xEE GPT-protective).
+# The msdos/MBR-mode equivalents of the type identities above - only used
+# when DISK_LAYOUT=msdos. ALPINE_ZFSBOOT_FAT_MBR_TYPE MUST match
+# bios/mbr.h's own ZFSBOOT_FAT_MBR_TYPE exactly (0x2E, unchanged from this
+# project's own former ZFSBOOT_BOOTBLOB_MBR_TYPE - only the name and what's
+# stored at the partition it identifies changed) - that's the one real,
+# load-bearing invariant here: stage2's own mbr_find_partition() call (see
+# bios/stage2_main.c) scans the disk's MBR partition table for exactly this
+# type byte to find the canonical FAT partition, the MBR equivalent of the
+# "EF00" GPT type code above. ALPINE_ZFSBOOT_STAGE2_MBR_TYPE, by contrast,
+# is NOT read by any code at all (same as ALPINE_ZFSBOOT_BIOS_BOOT_GUID
+# above, which stage1.S also never looks up - it just reads a fixed LBA) -
+# it exists purely so the stage2 partition shows up as a real, typed,
+# visible entry in the msdos partition table (`fdisk -l`, `sfdisk -d`, ...)
+# instead of occupying an implicit, tool-invisible gap that only this
+# project's own code and documentation would know about. Picked from the
+# same kind of unassigned-by-convention byte range as
+# ALPINE_ZFSBOOT_FAT_MBR_TYPE's own 0x2E (see that value's own comment for
+# why: not one of the many already-assigned classic MBR type codes like
+# 0x83 Linux/0x82 swap/0xEE GPT-protective).
 ALPINE_ZFSBOOT_STAGE2_MBR_TYPE="2D"
-ALPINE_ZFSBOOT_BOOTBLOB_MBR_TYPE="2E"
+ALPINE_ZFSBOOT_FAT_MBR_TYPE="2E"
 # STAGE2_LBA/STAGE2_SECTORS: must match stage1.S's own hardcoded constants
 # in the alpine-zfsboot repo EXACTLY - these are not independently
 # discovered at install time, they're a build-time invariant baked into the
@@ -352,7 +387,6 @@ ROOTFS_URL=""
 ROOTFS_SHA256_URL=""
 EFI_PARTITION=""
 BIOS_BOOT_PARTITION=""
-BOOTBLOB_PARTITION=""
 SWAP_PARTITION=""
 ZFS_PARTITION=""
 EFI_FALLBACK_NAME=""
@@ -362,7 +396,6 @@ ZFS_KMOD_PACKAGE=""
 efi_uuid=""
 swap_uuid=""
 WORKDIR=""
-BOOTBLOB_SECTORS=""
 
 # ==============================================================================
 # Helpers
@@ -479,6 +512,16 @@ apk_package_for_command() {
         # found" at the very last install step, after partitioning/pool
         # creation/chroot install have all already happened.
         dropbearkey) echo "dropbear" ;;
+        # The alpine-zfsboot CLI itself - always installed via
+        # `apk add alpine-zfsboot` from unidoc-aports in real use (the
+        # org's own stated practice - never fetched fresh from GitHub
+        # at install time), same package name as the command. This
+        # installer no longer implements stage1/stage2/EFI-loader/FAT-
+        # payload/config writing itself; it execs this binary (see
+        # install_alpine_zfsboot_bios()/_uefi()) exactly like every
+        # other required system command above, auto-installed by this
+        # same require_command() mechanism if missing.
+        alpine-zfsboot) echo "alpine-zfsboot" ;;
         *) echo "" ;;
     esac
 }
@@ -750,27 +793,12 @@ EOF
             die "ALPINE_ZFSBOOT_SSH_KEY is set but contains no actual key line (blank/whitespace only)."
     fi
 
-    # Every ALPINE_ZFSBOOT_* setting is persisted to the ESP - see that
-    # variable group's own top-of-file comment - and legacy BIOS mode
-    # creates no ESP at all. Without this check the install would
-    # silently write none of it and still report success: the operator
-    # sets rescue SSH up, gets no error, and discovers it was never
-    # reachable exactly when they need it most (a headless BIOS-only
-    # cloud host, mid-outage). Fail loudly here instead, at the same
-    # validation stage every other misconfiguration in this function is
-    # caught at, not partway through an otherwise-successful install.
-    if [ "${USE_UEFI}" = "no" ]; then
-        for zfsboot_v in "${ALPINE_ZFSBOOT_SSH_KEY}" "${ALPINE_ZFSBOOT_NET}" \
-                "${ALPINE_ZFSBOOT_IPV4}" "${ALPINE_ZFSBOOT_IPV4_ADDRESS}" \
-                "${ALPINE_ZFSBOOT_IPV4_GATEWAY}" "${ALPINE_ZFSBOOT_IPV6}" \
-                "${ALPINE_ZFSBOOT_IPV6_ADDRESS}" "${ALPINE_ZFSBOOT_IPV6_GATEWAY}" \
-                "${ALPINE_ZFSBOOT_SSH_LISTEN}" "${ALPINE_ZFSBOOT_SSH_PORT}" \
-                "${ALPINE_ZFSBOOT_SSH_ALLOW}"
-        do
-            [ -z "${zfsboot_v}" ] ||
-                die "ALPINE_ZFSBOOT_* settings are persisted to the ESP, and legacy BIOS mode (USE_UEFI=no) creates no ESP - alpine-zfsboot's /init has no other place to read them from. Unset them, or install in UEFI mode."
-        done
-    fi
+    # ALPINE_ZFSBOOT_* settings are persisted to EFI_PARTITION, the
+    # canonical FAT/ESP partition every layout now carries (UEFI/GPT,
+    # BIOS/GPT, and BIOS/msdos alike - alpine-zfsboot's own unified
+    # storage architecture) - no more USE_UEFI-gated refusal here. An
+    # earlier version of this project's own BIOS boot path had no
+    # filesystem at all to persist these to; that's no longer true.
 
     case "${SWAP_SIZE_GIB}" in
         ''|*[!0-9]*)
@@ -832,7 +860,7 @@ EOF
     fi
 
     for command in \
-        awk blkid chroot curl getent grep install lsblk mkfs.vfat mktemp \
+        alpine-zfsboot awk blkid chroot curl getent grep install lsblk mkfs.vfat mktemp \
         modprobe mount mountpoint mkswap od partprobe sha256sum sgdisk tar \
         tr umount wipefs zfs zgenhostid zpool
     do
@@ -845,14 +873,11 @@ EOF
     # Only required when actually needed - a plain, non-rescue install
     # (ALPINE_ZFSBOOT_SSH_KEY unset) must not fail or auto-install a
     # package just because this ONE optional feature wasn't requested,
-    # same posture as the DISK_LAYOUT-gated pair above. The explicit
-    # USE_UEFI=yes here is belt-and-suspenders, not load-bearing on its
-    # own - the BIOS-mode die() above already refuses a non-empty
-    # ALPINE_ZFSBOOT_SSH_KEY together with USE_UEFI=no before execution
-    # ever reaches this line - but spelling it out here too means this
-    # line's own correctness doesn't depend on tracing back through the
-    # rest of the function to see why it's safe.
-    if [ -n "${ALPINE_ZFSBOOT_SSH_KEY}" ] && [ "${USE_UEFI}" = "yes" ]; then
+    # same posture as the DISK_LAYOUT-gated pair above. No more USE_UEFI
+    # gate here - every layout has an EFI_PARTITION to persist rescue-SSH
+    # material to now (see this function's own comment above), not just
+    # UEFI installs.
+    if [ -n "${ALPINE_ZFSBOOT_SSH_KEY}" ]; then
         require_command "dropbearkey"
     fi
 
@@ -932,23 +957,117 @@ select_zfsboot_artifacts() {
             ALPINE_ZFSBOOT_EFI_URL="${ALPINE_ZFSBOOT_EFI_AARCH64_URL}"
         fi
     fi
-    # BIOS mode's three URLs already have their own x86_64-only defaults
-    # above (USE_UEFI=no is refused on aarch64 in validate_environment(),
-    # so there's no aarch64 BIOS variant to resolve here) - nothing further
-    # to resolve for that case.
+    # BIOS mode's five URLs (stage1/stage2/kernel/initrd/cmdline) already
+    # have their own x86_64-only defaults above (USE_UEFI=no is refused on
+    # aarch64 in validate_environment(), so there's no aarch64 BIOS variant
+    # to resolve here) - nothing further to resolve for that case.
+}
+
+# pin_zfsboot_release_urls resolves GitHub's "latest" alpine-zfsboot
+# release to ONE concrete tag, then rewrites every one of VARNAMES
+# (variable NAMES, not values - bash indirect expansion) still pointing
+# at the unpinned releases/latest/download/ convention to that SAME
+# resolved tag's own releases/download/<tag>/ path instead. A variable
+# already pointing somewhere else (an operator-set mirror/custom URL)
+# is left completely untouched - this only ever narrows an existing
+# "latest" redirect to a specific tag, never redirects a genuinely
+# custom URL anywhere.
+#
+# Closes a real, confirmed race this script has always had, structurally
+# identical to the one alpine-zfsboot's own Go-side tooling already
+# closed for itself (see internal/release.resolveTag() in that repo,
+# F16 in its PR #5 review): this file's own fetch_zfsboot_artifacts()
+# used to resolve "latest" independently for each of up to six URLs
+# (five artifacts + SHA256SUMS), one bare curl redirect apiece - if a
+# NEW alpine-zfsboot release was published on GitHub between any two of
+# those fetches, the artifacts downloaded here could come from two
+# DIFFERENT releases, checksum-verified against a checksums file that
+# might be from a THIRD - verify_zfsboot_checksum() only proves each
+# individual file matches SOME entry in SOME fetch of SHA256SUMS, never
+# that every artifact and the checksums file itself all came from the
+# exact same release. A narrow window in practice (GitHub releases
+# aren't published every few seconds) but a real one, and exactly the
+# kind of thing this project's own hardening pass exists to close
+# rather than leave as a known gap.
+#
+# Deliberately NOT delegating this fetch to `alpine-zfsboot install`'s
+# own internal tag-pinned/checksum-verified default path instead (which
+# would remove this duplication in shell entirely): that would move the
+# first real network/integrity failure from BEFORE partition_disk() to
+# AFTER partitioning/pool-creation/chroot-install have already run,
+# turning a cheap early refusal into an expensive one - see this
+# function's own header comment on why fetching happens where it does.
+# Pinning the URLs resolved here to one tag keeps that ordering intact
+# while closing the actual consistency gap.
+pin_zfsboot_release_urls() {
+    local tag api_response pinned var current
+
+    log "Resolving alpine-zfsboot's latest release (pinning every default download URL to one tag)"
+    api_response="$(curl --fail --silent --location "https://api.github.com/repos/unidoc/alpine-zfsboot/releases/latest")" ||
+        die "Could not resolve alpine-zfsboot's latest release via the GitHub API (api.github.com/repos/unidoc/alpine-zfsboot/releases/latest) - check network connectivity, or set the ALPINE_ZFSBOOT_*_FILE/_URL overrides for what you need to skip this lookup entirely."
+    tag="$(printf '%s' "${api_response}" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
+    [ -n "${tag}" ] ||
+        die "Could not find a tag_name field in the GitHub API response for alpine-zfsboot's latest release - the response may be malformed, or the API's own shape may have changed."
+    log "alpine-zfsboot latest release: ${tag}"
+
+    pinned="https://github.com/unidoc/alpine-zfsboot/releases/download/${tag}/"
+    for var in "$@"; do
+        current="${!var}"
+        case "${current}" in
+            */releases/latest/download/*)
+                printf -v "${var}" '%s%s' "${pinned}" "$(basename "${current}")"
+                ;;
+        esac
+    done
+}
+
+# needs_zfsboot_pinning VARNAMES... - true if at least one of VARNAMES
+# (URL variable names) still holds the unpinned releases/latest/download/
+# shape pin_zfsboot_release_urls() above would actually rewrite - used
+# to skip that function's own network call entirely when every artifact
+# this run needs is either a local *_FILE override or an
+# already-customized URL, so a fully offline/local-file install never
+# has to reach the network just to resolve a tag nothing here will use.
+needs_zfsboot_pinning() {
+    local var
+    for var in "$@"; do
+        case "${!var}" in
+            */releases/latest/download/*) return 0 ;;
+        esac
+    done
+    return 1
 }
 
 # Downloads (or copies, for a *_FILE override) whichever alpine-zfsboot
 # artifacts this install actually needs into WORKDIR, and verifies each
-# against ALPINE_ZFSBOOT_CHECKSUMS_URL if set. Deliberately done BEFORE
-# partition_disk(): in BIOS mode, the boot-blob partition has to be sized
-# from the real downloaded bootblob file's own byte size (see
-# compute_bootblob_sectors()), so that file has to already exist locally
-# before partitioning can happen at all.
+# against ALPINE_ZFSBOOT_CHECKSUMS_URL if set. Called before
+# partition_disk() (same ordering as before this project's FAT-unification
+# change) even though the FAT/ESP partition itself is now a fixed size,
+# not sized from any of these files - kept this way so a missing/bad
+# artifact is caught before any disk-destructive step runs, not partway
+# through one.
 fetch_zfsboot_artifacts() {
     log "Fetching alpine-zfsboot boot artifacts"
 
+    # The alpine-zfsboot CLI itself is NOT fetched here - it's a
+    # required system command like sgdisk/dropbear (require_command's
+    # own apk_package_for_command() mapping, checked in
+    # validate_environment()), installed via `apk add alpine-zfsboot`
+    # ahead of time in real use, never downloaded fresh from GitHub at
+    # install time (the org's own stated practice). Every
+    # `"${WORKDIR}/alpine-zfsboot"` call below is just `alpine-zfsboot`
+    # now, resolved via PATH.
+
     if [ "${USE_UEFI}" = "yes" ]; then
+        # Pin ONLY if this artifact will actually be fetched by URL (a
+        # *_FILE override never touches the network at all, and might be
+        # the ONLY thing reachable in an airgapped/mirror-only setup -
+        # see pin_zfsboot_release_urls's own header comment) AND its URL
+        # is still the unpinned default shape (an operator-set custom
+        # mirror is left alone, same reasoning).
+        if [ -z "${ALPINE_ZFSBOOT_EFI_FILE}" ] && needs_zfsboot_pinning ALPINE_ZFSBOOT_EFI_URL; then
+            pin_zfsboot_release_urls ALPINE_ZFSBOOT_EFI_URL ALPINE_ZFSBOOT_CHECKSUMS_URL
+        fi
         if [ -n "${ALPINE_ZFSBOOT_EFI_FILE}" ]; then
             [ -f "${ALPINE_ZFSBOOT_EFI_FILE}" ] ||
                 die "Missing alpine-zfsboot EFI file: ${ALPINE_ZFSBOOT_EFI_FILE}"
@@ -958,6 +1077,23 @@ fetch_zfsboot_artifacts() {
             verify_zfsboot_checksum "${WORKDIR}/alpine-zfsboot.EFI" "$(basename "${ALPINE_ZFSBOOT_EFI_URL}")"
         fi
         return 0
+    fi
+
+    # Same reasoning as the UEFI branch above: pin only the URLs among
+    # the five BIOS artifacts that will actually be fetched (not
+    # *_FILE-overridden) and are still in the unpinned default shape -
+    # one resolution shared by whichever subset of stage1/stage2/kernel/
+    # initrd/cmdline/SHA256SUMS this run actually needs, never a network
+    # call an all-*_FILE or all-custom-mirror install has no use for.
+    if { [ -z "${ALPINE_ZFSBOOT_BIOS_STAGE1_FILE}" ] && needs_zfsboot_pinning ALPINE_ZFSBOOT_BIOS_STAGE1_URL; } ||
+       { [ -z "${ALPINE_ZFSBOOT_BIOS_STAGE2_FILE}" ] && needs_zfsboot_pinning ALPINE_ZFSBOOT_BIOS_STAGE2_URL; } ||
+       { [ -z "${ALPINE_ZFSBOOT_BIOS_KERNEL_FILE}" ] && needs_zfsboot_pinning ALPINE_ZFSBOOT_BIOS_KERNEL_URL; } ||
+       { [ -z "${ALPINE_ZFSBOOT_BIOS_INITRD_FILE}" ] && needs_zfsboot_pinning ALPINE_ZFSBOOT_BIOS_INITRD_URL; } ||
+       { [ -z "${ALPINE_ZFSBOOT_BIOS_CMDLINE_FILE}" ] && needs_zfsboot_pinning ALPINE_ZFSBOOT_BIOS_CMDLINE_URL; }
+    then
+        pin_zfsboot_release_urls ALPINE_ZFSBOOT_BIOS_STAGE1_URL ALPINE_ZFSBOOT_BIOS_STAGE2_URL \
+            ALPINE_ZFSBOOT_BIOS_KERNEL_URL ALPINE_ZFSBOOT_BIOS_INITRD_URL ALPINE_ZFSBOOT_BIOS_CMDLINE_URL \
+            ALPINE_ZFSBOOT_CHECKSUMS_URL
     fi
 
     if [ -n "${ALPINE_ZFSBOOT_BIOS_STAGE1_FILE}" ]; then
@@ -989,33 +1125,32 @@ fetch_zfsboot_artifacts() {
     [ "${stage2_size}" -le $((ALPINE_ZFSBOOT_STAGE2_SECTORS * 512)) ] ||
         die "stage2.bin is ${stage2_size} bytes, exceeds the ${ALPINE_ZFSBOOT_STAGE2_SECTORS}-sector budget stage1 reads (see ALPINE_ZFSBOOT_STAGE2_SECTORS) - this script and the alpine-zfsboot build it came from have drifted apart."
 
-    if [ -n "${ALPINE_ZFSBOOT_BIOS_BOOTBLOB_FILE}" ]; then
-        [ -f "${ALPINE_ZFSBOOT_BIOS_BOOTBLOB_FILE}" ] ||
-            die "Missing alpine-zfsboot BIOS boot-blob file: ${ALPINE_ZFSBOOT_BIOS_BOOTBLOB_FILE}"
-        cp "${ALPINE_ZFSBOOT_BIOS_BOOTBLOB_FILE}" "${WORKDIR}/bootblob.img"
+    if [ -n "${ALPINE_ZFSBOOT_BIOS_KERNEL_FILE}" ]; then
+        [ -f "${ALPINE_ZFSBOOT_BIOS_KERNEL_FILE}" ] ||
+            die "Missing alpine-zfsboot BIOS kernel file: ${ALPINE_ZFSBOOT_BIOS_KERNEL_FILE}"
+        cp "${ALPINE_ZFSBOOT_BIOS_KERNEL_FILE}" "${WORKDIR}/bios-kernel"
     else
-        curl --fail --location --output "${WORKDIR}/bootblob.img" "${ALPINE_ZFSBOOT_BIOS_BOOTBLOB_URL}"
-        verify_zfsboot_checksum "${WORKDIR}/bootblob.img" "$(basename "${ALPINE_ZFSBOOT_BIOS_BOOTBLOB_URL}")"
+        curl --fail --location --output "${WORKDIR}/bios-kernel" "${ALPINE_ZFSBOOT_BIOS_KERNEL_URL}"
+        verify_zfsboot_checksum "${WORKDIR}/bios-kernel" "$(basename "${ALPINE_ZFSBOOT_BIOS_KERNEL_URL}")"
     fi
 
-    compute_bootblob_sectors
-}
+    if [ -n "${ALPINE_ZFSBOOT_BIOS_INITRD_FILE}" ]; then
+        [ -f "${ALPINE_ZFSBOOT_BIOS_INITRD_FILE}" ] ||
+            die "Missing alpine-zfsboot BIOS initrd file: ${ALPINE_ZFSBOOT_BIOS_INITRD_FILE}"
+        cp "${ALPINE_ZFSBOOT_BIOS_INITRD_FILE}" "${WORKDIR}/bios-initrd"
+    else
+        curl --fail --location --output "${WORKDIR}/bios-initrd" "${ALPINE_ZFSBOOT_BIOS_INITRD_URL}"
+        verify_zfsboot_checksum "${WORKDIR}/bios-initrd" "$(basename "${ALPINE_ZFSBOOT_BIOS_INITRD_URL}")"
+    fi
 
-# Sets BOOTBLOB_SECTORS from the real downloaded bootblob.img size, rounded
-# up to whole 512-byte sectors, plus a fixed margin. Oversizing the
-# partition is always safe (stage2 checks the blob's own header-declared
-# sizes against what the partition claims to hold, not the other way
-# around - see the alpine-zfsboot repo's own stage2_main.c) - this margin
-# exists purely so a small, well-understood rounding slip in this script's
-# own arithmetic can never under-size the partition, not because the exact
-# byte count is actually in doubt.
-compute_bootblob_sectors() {
-    local bootblob_bytes bootblob_min_sectors margin_sectors
-    bootblob_bytes="$(stat -c%s "${WORKDIR}/bootblob.img" 2>/dev/null || wc -c < "${WORKDIR}/bootblob.img")"
-    bootblob_min_sectors=$(( (bootblob_bytes + 511) / 512 ))
-    margin_sectors=2048 # 1 MiB of headroom
-    BOOTBLOB_SECTORS=$((bootblob_min_sectors + margin_sectors))
-    log "boot-blob is ${bootblob_bytes} bytes (${bootblob_min_sectors} sectors) - partition will be ${BOOTBLOB_SECTORS} sectors"
+    if [ -n "${ALPINE_ZFSBOOT_BIOS_CMDLINE_FILE}" ]; then
+        [ -f "${ALPINE_ZFSBOOT_BIOS_CMDLINE_FILE}" ] ||
+            die "Missing alpine-zfsboot BIOS cmdline file: ${ALPINE_ZFSBOOT_BIOS_CMDLINE_FILE}"
+        cp "${ALPINE_ZFSBOOT_BIOS_CMDLINE_FILE}" "${WORKDIR}/bios-cmdline"
+    else
+        curl --fail --location --output "${WORKDIR}/bios-cmdline" "${ALPINE_ZFSBOOT_BIOS_CMDLINE_URL}"
+        verify_zfsboot_checksum "${WORKDIR}/bios-cmdline" "$(basename "${ALPINE_ZFSBOOT_BIOS_CMDLINE_URL}")"
+    fi
 }
 
 partition_disk() {
@@ -1072,7 +1207,7 @@ partition_disk() {
             # (-a 2048) for every partition created after this one - sgdisk
             # processes its own arguments in the order given, so this ordering
             # is what makes both things true at once: partition 1 lands
-            # exactly where stage1 expects it, and the boot-blob/swap/ZFS
+            # exactly where stage1 expects it, and the FAT/swap/ZFS
             # partitions after it still get normal, SSD/4Kn-friendly alignment.
             BIOS_BOOT_PARTITION="$(partition_path "${SYSDRIVE}" "${next_partnum}")"
             sgdisk_args=(
@@ -1084,11 +1219,24 @@ partition_disk() {
             )
             next_partnum=$((next_partnum + 1))
 
-            BOOTBLOB_PARTITION="$(partition_path "${SYSDRIVE}" "${next_partnum}")"
+            # The canonical alpine-zfsboot FAT/ESP partition - EF00, the
+            # exact same sgdisk type code and size the USE_UEFI=yes branch
+            # above uses for its own EFI_PARTITION. One storage
+            # architecture regardless of firmware (see this project's own
+            # architecture-decision writeup): stage2's FAT32 reader
+            # (alpine-zfsboot's bios/fat.c) finds this partition by the
+            # exact same GPT type identity UEFI firmware itself looks for.
+            # Fixed-size, not computed from any artifact's own byte size
+            # (an earlier version of this project sized this partition
+            # from a packed "boot blob" file's exact length, plus a
+            # margin) - a real kernel/initrd/cmdline is a tiny fraction of
+            # 512MiB, and a fixed size means updating them later is a
+            # plain file replace, never a partition-table change.
+            EFI_PARTITION="$(partition_path "${SYSDRIVE}" "${next_partnum}")"
             sgdisk_args+=(
-                -n "${next_partnum}:0:+${BOOTBLOB_SECTORS}"
-                -t "${next_partnum}:${ALPINE_ZFSBOOT_BOOTBLOB_GUID}"
-                -c "${next_partnum}:alpine-zfsboot-bootblob"
+                -n "${next_partnum}:0:+512MiB"
+                -t "${next_partnum}:EF00"
+                -c "${next_partnum}:EFI"
             )
             next_partnum=$((next_partnum + 1))
         fi
@@ -1118,8 +1266,13 @@ partition_disk() {
         # own comment), and everything computed here has to agree with
         # that exactly, not approximately.
         log "Creating msdos/MBR partitions"
-        local disk_sectors stage2_end bootblob_start bootblob_end
+        local disk_sectors stage2_end efi_start efi_end efi_sectors
         local swap_start swap_end swap_sectors zfs_start zfs_sectors reserve_sectors
+
+        # Fixed size, same 512MiB convention as the GPT branch's own
+        # EFI_PARTITION above - not computed from any artifact's own byte
+        # size, see that branch's own comment for why.
+        efi_sectors=$((512 * 1024 * 1024 / 512))
 
         # blockdev --getsz always reports in 512-byte units (documented
         # behavior, independent of the device's own logical sector
@@ -1139,20 +1292,20 @@ partition_disk() {
         # own fixed-LBA first partition. LBAs stage2_end+1..2047 are left
         # unpartitioned (the "MBR gap"), same as the GPT branch leaves
         # LBA 1-33 unpartitioned ahead of its own fixed-LBA partition 1.
-        bootblob_start=2048
+        efi_start=2048
         # A real check, not decoration: with today's fixed
         # ALPINE_ZFSBOOT_STAGE2_LBA/SECTORS (34/64) this can never
         # actually trip, but it's the one thing that WOULD silently
         # overlap partition 1 and 2 if either constant ever grew past
         # this hardcoded 2048-sector gap without this line also being
         # updated - caught here, at partition-table-write time, instead
-        # of as a corrupted boot-blob discovered only much later at
+        # of as a broken FAT partition discovered only much later at
         # actual boot.
-        [ "${bootblob_start}" -gt "${stage2_end}" ] ||
-            die "ALPINE_ZFSBOOT_STAGE2_SECTORS has grown too large for the fixed ${bootblob_start}-sector bootblob_start gap (stage2 now ends at LBA ${stage2_end}) - raise bootblob_start above stage2_end in this script and re-run."
-        bootblob_end=$((bootblob_start + BOOTBLOB_SECTORS - 1))
+        [ "${efi_start}" -gt "${stage2_end}" ] ||
+            die "ALPINE_ZFSBOOT_STAGE2_SECTORS has grown too large for the fixed ${efi_start}-sector efi_start gap (stage2 now ends at LBA ${stage2_end}) - raise efi_start above stage2_end in this script and re-run."
+        efi_end=$((efi_start + efi_sectors - 1))
 
-        swap_start=$(( ( (bootblob_end + 1) + 2047 ) / 2048 * 2048 ))
+        swap_start=$(( ( (efi_end + 1) + 2047 ) / 2048 * 2048 ))
         if [ "${SWAP_SIZE_GIB}" -gt 0 ]; then
             swap_sectors=$((SWAP_SIZE_GIB * 1024 * 1024 * 1024 / 512))
         else
@@ -1175,10 +1328,10 @@ partition_disk() {
         reserve_sectors=$((10 * 1024 * 1024 / 512))
         zfs_sectors=$((disk_sectors - zfs_start - reserve_sectors))
         [ "${zfs_sectors}" -gt 0 ] ||
-            die "SYSDRIVE is too small for this msdos layout (disk has ${disk_sectors} sectors, but bootblob+swap already consume up through LBA ${zfs_start} - the ZFS partition would end up with ${zfs_sectors} sectors). Use a larger disk or a smaller SWAP_SIZE_GIB."
+            die "SYSDRIVE is too small for this msdos layout (disk has ${disk_sectors} sectors, but EFI+swap already consume up through LBA ${zfs_start} - the ZFS partition would end up with ${zfs_sectors} sectors). Use a larger disk or a smaller SWAP_SIZE_GIB."
 
         BIOS_BOOT_PARTITION="$(partition_path "${SYSDRIVE}" 1)"
-        BOOTBLOB_PARTITION="$(partition_path "${SYSDRIVE}" 2)"
+        EFI_PARTITION="$(partition_path "${SYSDRIVE}" 2)"
         SWAP_PARTITION="$(partition_path "${SYSDRIVE}" 3)"
         ZFS_PARTITION="$(partition_path "${SYSDRIVE}" 4)"
 
@@ -1196,7 +1349,7 @@ label: dos
 unit: sectors
 
 start=${ALPINE_ZFSBOOT_STAGE2_LBA}, size=${ALPINE_ZFSBOOT_STAGE2_SECTORS}, type=${ALPINE_ZFSBOOT_STAGE2_MBR_TYPE}, bootable
-start=${bootblob_start}, size=${BOOTBLOB_SECTORS}, type=${ALPINE_ZFSBOOT_BOOTBLOB_MBR_TYPE}
+start=${efi_start}, size=${efi_sectors}, type=${ALPINE_ZFSBOOT_FAT_MBR_TYPE}
 start=${swap_start}, size=${swap_sectors}, type=82
 start=${zfs_start}, size=${zfs_sectors}, type=83
 EOF
@@ -1211,7 +1364,6 @@ EOF
     fi
     if [ -n "${BIOS_BOOT_PARTITION}" ]; then
         wait_for_device "${BIOS_BOOT_PARTITION}"
-        wait_for_device "${BOOTBLOB_PARTITION}"
     fi
     wait_for_device "${SWAP_PARTITION}"
     wait_for_device "${ZFS_PARTITION}"
@@ -1421,10 +1573,14 @@ create_hostid() {
 }
 
 format_boot_partition() {
-    if [ "${USE_UEFI}" != "yes" ]; then
-        log "Skipping EFI System Partition (legacy BIOS mode has no filesystem-based boot code at all - see this file's own disk-layout comment)"
-        return 0
-    fi
+    # Every layout (UEFI/GPT, BIOS/GPT, BIOS/msdos) has an EFI_PARTITION
+    # now - alpine-zfsboot's own unified storage architecture: this is the
+    # canonical FAT/ESP partition, and BIOS mode's own stage2 reads its
+    # kernel/initramfs/cmdline directly off it (see install_alpine_zfsboot_
+    # bios() below), same as UEFI firmware reads BOOTX64.EFI/BOOTAA64.EFI
+    # off it. No more "legacy BIOS mode has no filesystem-based boot code"
+    # early-out - that was true of this project's own former raw "boot
+    # blob" partition format, not of the current one.
     log "Formatting EFI System Partition"
     # NOT partprobe here - confirmed a real, unavoidable failure mode on
     # a real run: by this point create_zpool()/import_pool() already have
@@ -1495,9 +1651,9 @@ format_boot_partition() {
 
 write_fstab() {
     : > "${MOUNT_LOCATION}/etc/fstab"
-    if [ "${USE_UEFI}" = "yes" ]; then
-        printf 'UUID=%s /boot/efi vfat defaults,noauto,noatime 0 2\n' "${efi_uuid}" >> "${MOUNT_LOCATION}/etc/fstab"
-    fi
+    # Every layout has an EFI_PARTITION now (see format_boot_partition()'s
+    # own comment) - no more USE_UEFI gate here.
+    printf 'UUID=%s /boot/efi vfat defaults,noauto,noatime 0 2\n' "${efi_uuid}" >> "${MOUNT_LOCATION}/etc/fstab"
     if [ "${SWAP_SIZE_GIB}" -gt 0 ]; then
         printf 'UUID=%s none swap sw 0 0\n' "${swap_uuid}" >> "${MOUNT_LOCATION}/etc/fstab"
     fi
@@ -1843,12 +1999,12 @@ run_chroot_install() {
 # entry needed at all. A backup copy under a fixed name too - cheap
 # insurance if the primary copy is ever damaged in place.
 install_alpine_zfsboot_uefi() {
-    mkdir -p "${MOUNT_LOCATION}/boot/efi/EFI/BOOT"
-    cp "${WORKDIR}/alpine-zfsboot.EFI" \
-       "${MOUNT_LOCATION}/boot/efi/EFI/BOOT/${EFI_FALLBACK_NAME}"
-    cp "${WORKDIR}/alpine-zfsboot.EFI" \
-       "${MOUNT_LOCATION}/boot/efi/EFI/BOOT/${EFI_FALLBACK_NAME}.backup"
-    write_alpine_zfsboot_esp_config
+    zfsboot_config_args
+    alpine-zfsboot install "${SYSDRIVE}" \
+        --root "${MOUNT_LOCATION}" --firmware uefi --yes \
+        --efi-file "${WORKDIR}/alpine-zfsboot.EFI" \
+        "${ZFSBOOT_CONFIG_ARGS[@]}"
+    sync
 }
 
 # Per-machine alpine-zfsboot settings (rescue ssh_key, static network,
@@ -1874,145 +2030,83 @@ install_alpine_zfsboot_uefi() {
 # here", and physical/firmware-level access to it is equivalent to
 # extracting this machine's rescue SSH host identity. NEVER
 # ZROOT_PASSPHRASE or anything else secret beyond that goes here.
-write_alpine_zfsboot_esp_config() {
-    local config_file="${MOUNT_LOCATION}/boot/efi/EFI/alpine-zfsboot/config"
-    local authorized_keys_file="${MOUNT_LOCATION}/boot/efi/EFI/alpine-zfsboot/authorized_keys"
-    local host_key_file="${MOUNT_LOCATION}/boot/efi/EFI/alpine-zfsboot/ssh_host_ed25519_key"
-    # ${config_file%/*}, not `dirname` - confirmed the hard way earlier
-    # THIS SAME SESSION that dirname isn't a safe assumption on a
-    # minimal/rescue Alpine environment (alpine-zfsboot's own /init hit
-    # "dirname: not found"); this rescue system is fuller than that
-    # initramfs but there's no reason to re-risk the identical class of
-    # bug one file over.
-    mkdir -p "${config_file%/*}"
-    : > "${config_file}"
-    if [ -n "${ALPINE_ZFSBOOT_SSH_KEY}" ]; then
-        # One bare key per line, written verbatim - no base64, no
-        # alpine-zfsboot.* config key at all, but also NOT full OpenSSH
-        # authorized_keys syntax (see this variable's own declaration
-        # comment above for why operator options are deliberately
-        # rejected, not honored). Earlier version of this mechanism
-        # wrote alpine-zfsboot.ssh_key=<base64 pubkey> into config_file
-        # itself; replaced (not kept alongside) once a real hardware
-        # test motivated the two-file layout - see rescue-ssh.sh's own
-        # header comment for the full reasoning.
-        # ALPINE_ZFSBOOT_SSH_KEY may hold several newline-separated
-        # lines (see its own declaration comment/validate_environment()'s
-        # loop) - printf here preserves that as-is, one line per key.
-        printf '%s\n' "${ALPINE_ZFSBOOT_SSH_KEY}" > "${authorized_keys_file}"
-        # chmod here is best-effort, not the real protection - vfat has
-        # no real unix permission bits (whatever a kernel driver reports
-        # back is synthesized from the mount's own dmask/fmask/uid/gid
-        # options, not this file's own metadata), so the actual boundary
-        # protecting this ESP's content is who can get physical/mount
-        # access to the partition at all, not this chmod call.
-        chmod 0600 "${authorized_keys_file}"
-
-        # Generated fresh on every install run (this function always
-        # truncates/rewrites config_file the same way, for the same
-        # reason: "installation time" is exactly when this project's own
-        # author asked for a new identity to be minted - a genuine
-        # reinstall onto the same disk deliberately gets a new
-        # fingerprint, not a preserved one, matching a real machine
-        # getting re-imaged). dropbearkey's own native key format, NOT
-        # ssh-keygen/PEM - guaranteed compatible with the bundled
-        # dropbear binary that will actually load it later (see
-        # rescue-ssh.sh's own `dropbear -r` invocation), with no
-        # PEM-vs-dropbear-format compatibility question to even ask.
-        # rm -f first: dropbearkey refuses to overwrite an existing key
-        # file outright ("Failed moving key file to hostkey2: File
-        # exists", confirmed against the real binary) rather than
-        # regenerating it - currently unreachable in practice (the ESP is
-        # always freshly `mkfs.vfat`'d earlier in this same install), but
-        # this function's own "fresh every install run" claim above
-        # should be true by construction, not true only because nothing
-        # else in this script happens to preserve the ESP today.
-        rm -f "${host_key_file}"
-        dropbearkey -t ed25519 -f "${host_key_file}" >/dev/null
-        chmod 0600 "${host_key_file}"
-    fi
-    if [ -n "${ALPINE_ZFSBOOT_NET}" ]; then
-        printf 'alpine-zfsboot.net=%s\n' "${ALPINE_ZFSBOOT_NET}" >> "${config_file}"
-    fi
-    if [ -n "${ALPINE_ZFSBOOT_IPV4}" ]; then
-        printf 'alpine-zfsboot.ipv4=%s\n' "${ALPINE_ZFSBOOT_IPV4}" >> "${config_file}"
-    fi
-    if [ -n "${ALPINE_ZFSBOOT_IPV4_ADDRESS}" ]; then
-        printf 'alpine-zfsboot.ipv4.address=%s\n' "${ALPINE_ZFSBOOT_IPV4_ADDRESS}" >> "${config_file}"
-    fi
-    if [ -n "${ALPINE_ZFSBOOT_IPV4_GATEWAY}" ]; then
-        printf 'alpine-zfsboot.ipv4.gateway=%s\n' "${ALPINE_ZFSBOOT_IPV4_GATEWAY}" >> "${config_file}"
-    fi
-    if [ -n "${ALPINE_ZFSBOOT_IPV6}" ]; then
-        printf 'alpine-zfsboot.ipv6=%s\n' "${ALPINE_ZFSBOOT_IPV6}" >> "${config_file}"
-    fi
-    if [ -n "${ALPINE_ZFSBOOT_IPV6_ADDRESS}" ]; then
-        printf 'alpine-zfsboot.ipv6.address=%s\n' "${ALPINE_ZFSBOOT_IPV6_ADDRESS}" >> "${config_file}"
-    fi
-    if [ -n "${ALPINE_ZFSBOOT_IPV6_GATEWAY}" ]; then
-        printf 'alpine-zfsboot.ipv6.gateway=%s\n' "${ALPINE_ZFSBOOT_IPV6_GATEWAY}" >> "${config_file}"
-    fi
-    if [ -n "${ALPINE_ZFSBOOT_SSH_LISTEN}" ]; then
-        printf 'alpine-zfsboot.ssh.listen=%s\n' "${ALPINE_ZFSBOOT_SSH_LISTEN}" >> "${config_file}"
-    fi
-    if [ -n "${ALPINE_ZFSBOOT_SSH_PORT}" ]; then
-        printf 'alpine-zfsboot.ssh.port=%s\n' "${ALPINE_ZFSBOOT_SSH_PORT}" >> "${config_file}"
-    fi
-    if [ -n "${ALPINE_ZFSBOOT_SSH_ALLOW}" ]; then
-        printf 'alpine-zfsboot.ssh.allow=%s\n' "${ALPINE_ZFSBOOT_SSH_ALLOW}" >> "${config_file}"
-    fi
+# zfsboot_config_args populates the global ZFSBOOT_CONFIG_ARGS array with
+# whichever --ssh-key/--net/--ipv4*/--ipv6*/--ssh-* flags this install
+# actually needs, one per set ALPINE_ZFSBOOT_* env var - shared by both
+# install_alpine_zfsboot_bios() and install_alpine_zfsboot_uefi(), so the
+# exact same config surface reaches `alpine-zfsboot install` on either
+# firmware. This IS what write_alpine_zfsboot_esp_config() used to do by
+# writing EFI/ALPINE/config/authorized_keys/ssh_host_ed25519_key directly
+# in shell - that writing now happens inside `alpine-zfsboot install`
+# itself (transactional - temp file, fsync, rename, fsync the directory -
+# see internal/espconfig.WriteFile in that repo, real hardening the old
+# plain `: > config_file` truncate-in-place never had), this function's
+# only job is building the flags that tell it what to write.
+#
+# ALPINE_ZFSBOOT_SSH_KEY may hold several newline-separated lines (see its
+# own declaration comment/validate_environment()'s loop) - a single array
+# element preserves that exactly, same as the old printf '%s\n' did.
+zfsboot_config_args() {
+    ZFSBOOT_CONFIG_ARGS=()
+    [ -n "${ALPINE_ZFSBOOT_SSH_KEY}" ] && ZFSBOOT_CONFIG_ARGS+=(--ssh-key "${ALPINE_ZFSBOOT_SSH_KEY}")
+    [ -n "${ALPINE_ZFSBOOT_NET}" ] && ZFSBOOT_CONFIG_ARGS+=(--net "${ALPINE_ZFSBOOT_NET}")
+    [ -n "${ALPINE_ZFSBOOT_IPV4}" ] && ZFSBOOT_CONFIG_ARGS+=(--ipv4 "${ALPINE_ZFSBOOT_IPV4}")
+    [ -n "${ALPINE_ZFSBOOT_IPV4_ADDRESS}" ] && ZFSBOOT_CONFIG_ARGS+=(--ipv4-address "${ALPINE_ZFSBOOT_IPV4_ADDRESS}")
+    [ -n "${ALPINE_ZFSBOOT_IPV4_GATEWAY}" ] && ZFSBOOT_CONFIG_ARGS+=(--ipv4-gateway "${ALPINE_ZFSBOOT_IPV4_GATEWAY}")
+    [ -n "${ALPINE_ZFSBOOT_IPV6}" ] && ZFSBOOT_CONFIG_ARGS+=(--ipv6 "${ALPINE_ZFSBOOT_IPV6}")
+    [ -n "${ALPINE_ZFSBOOT_IPV6_ADDRESS}" ] && ZFSBOOT_CONFIG_ARGS+=(--ipv6-address "${ALPINE_ZFSBOOT_IPV6_ADDRESS}")
+    [ -n "${ALPINE_ZFSBOOT_IPV6_GATEWAY}" ] && ZFSBOOT_CONFIG_ARGS+=(--ipv6-gateway "${ALPINE_ZFSBOOT_IPV6_GATEWAY}")
+    [ -n "${ALPINE_ZFSBOOT_SSH_LISTEN}" ] && ZFSBOOT_CONFIG_ARGS+=(--ssh-listen "${ALPINE_ZFSBOOT_SSH_LISTEN}")
+    [ -n "${ALPINE_ZFSBOOT_SSH_PORT}" ] && ZFSBOOT_CONFIG_ARGS+=(--ssh-port "${ALPINE_ZFSBOOT_SSH_PORT}")
+    [ -n "${ALPINE_ZFSBOOT_SSH_ALLOW}" ] && ZFSBOOT_CONFIG_ARGS+=(--ssh-allow "${ALPINE_ZFSBOOT_SSH_ALLOW}")
     return 0
 }
 
-# BIOS mode: writes stage1 onto the disk's own protective-MBR boot sector
-# (LBA 0), and stage2 + the boot blob onto the two dedicated partitions
-# partition_disk() already created for them at the right position/size.
-#
-# Only the first 440 bytes of LBA 0 are ever touched, never the whole 512-
-# byte sector - bytes 440-443 are the MBR disk identifier (written by
-# sfdisk in DISK_LAYOUT=msdos mode; GPT mode has no equivalent to lose,
-# a protective MBR carries no disk signature), bytes 446-509 are the REAL
-# partition table entry partition_disk() already wrote, and bytes 510-511
-# are the 0xAA55 boot signature it also already wrote correctly. A wider
-# 446-byte write silently zeroes the disk identifier back out on every
-# msdos-layout install (stage1.bin's own bytes past its ~56 bytes of real
-# code are zero padding, not preserved content) - confirmed on a real
-# loop device: `blkid -p` loses the partition-table UUID entirely after a
-# 446-byte write, stays intact at 440. Which tool wrote the partition
-# table itself depends on DISK_LAYOUT: sgdisk's own protective-MBR GPT
-# partition entry for DISK_LAYOUT=gpt (the default), or sfdisk's own real
-# primary partition table for DISK_LAYOUT=msdos - either way, overwriting
-# it would leave the disk with a broken partition table - every
-# partitioning tool, and BIOS firmware itself, cares about that, unlike
-# stage1's own now-overwritten code region.
+# BIOS mode: hands stage1/stage2/kernel/initramfs/cmdline to
+# `alpine-zfsboot install`, which writes stage1 onto the disk's own
+# protective-MBR boot sector (LBA 0, only the first 440 bytes - bytes
+# 440-509 are the REAL partition table partition_disk() already wrote,
+# bytes 510-511 are the 0xAA55 boot signature - see
+# internal/biosboot.WriteStage1's own doc comment in the alpine-zfsboot
+# repo for exactly why 440, not 446 or the whole 512-byte sector),
+# stage2 at the fixed LBA alpine-installer's own partition_disk()
+# already reserved for it, and kernel/initramfs/cmdline as ordinary
+# files onto the canonical FAT/ESP partition (EFI_PARTITION - already
+# formatted and mounted at ${MOUNT_LOCATION}/boot/efi by
+# format_boot_partition(), which runs before this in main()'s own
+# sequence) - the same partition alpine-zfsboot's stage2 (bios/fat.c)
+# reads them from at boot, and the same one UEFI firmware boots
+# BOOTX64.EFI/BOOTAA64.EFI from.
 install_alpine_zfsboot_bios() {
-    # bs=440 count=1 - ONE single 440-byte write, not 440 separate
-    # single-byte ones (an earlier version of this line used `bs=1
-    # count=440`, which really did write successfully by dd's own exit
-    # status every time, yet a REAL run's own read-back still didn't
-    # match past the first ~64 bytes: confirmed directly via a hex dump
-    # of both sides on a real failure - bytes 0-63 matched exactly,
-    # stage1.bin's actual content past its ~56 bytes of real code is
-    # all zero out to the 440-byte mark, and the disk's own read-back
-    # diverged from that somewhere past byte 64. 440 separate 1-byte
-    # write() calls to a raw block device is not the standard, well-
-    # established way to write boot-sector code (every real-world MBR
-    # installer uses one bs=440 write) for exactly this reason - it's
-    # 440 separate opportunities for a sub-sector read-modify-write
-    # cycle (what the block layer does under the hood for a write
-    # smaller than the device's own logical/physical sector size) to
-    # not fully land, instead of one atomic operation.
-    dd if="${WORKDIR}/stage1.bin" of="${SYSDRIVE}" bs=440 count=1 conv=notrunc status=none
-
-    dd if="${WORKDIR}/stage2.bin" of="${BIOS_BOOT_PARTITION}" bs=512 conv=notrunc status=none
-
-    dd if="${WORKDIR}/bootblob.img" of="${BOOTBLOB_PARTITION}" bs=1M conv=notrunc status=none
+    # alpine-zfsboot install owns every write below now - stage1 (LBA 0,
+    # 440 bytes, preserving the partition table past it), stage2 (the
+    # fixed LBA 34 extent, zeroed then written, only after confirming
+    # nothing on the disk's own partition table - GPT or msdos - actually
+    # overlaps that extent, see internal/bootenv.CheckStage2ExtentFree in
+    # that repo, the fail-closed SAFETY gate this shell code used to have
+    # no equivalent of at all; the cosmetic partition entry this script's
+    # own partition_disk() still creates at this same extent, above, is
+    # tolerated by that check, not required by it), and
+    # EFI/ALPINE/{KERNEL,INITRD,CMDLINE} - each verified byte-for-byte
+    # immediately after writing, dying on any mismatch before this
+    # function returns. One authoritative implementation of this on-disk
+    # ABI, not a second one duplicated here in shell.
+    zfsboot_config_args
+    alpine-zfsboot install "${SYSDRIVE}" \
+        --root "${MOUNT_LOCATION}" --firmware bios --yes \
+        --stage1-file "${WORKDIR}/stage1.bin" \
+        --stage2-file "${WORKDIR}/stage2.bin" \
+        --kernel-file "${WORKDIR}/bios-kernel" \
+        --initrd-file "${WORKDIR}/bios-initrd" \
+        --cmdline-file "${WORKDIR}/bios-cmdline" \
+        "${ZFSBOOT_CONFIG_ARGS[@]}"
 
     # Without this, the in-kernel block-device cache can still be holding
-    # stale/partial data for these raw-written partitions - harmless once
-    # the disk is actually rebooted into firmware, but a real, confirmable
-    # gap for anything in THIS script that might try to re-read what was
-    # just written (verify_installation() below does exactly that).
+    # stale/partial data for the raw-written stage1/stage2 regions -
+    # harmless once the disk is actually rebooted into firmware, but a
+    # real, confirmable gap for anything in THIS script that might try to
+    # re-read what was just written (verify_installation() below does
+    # exactly that, via a fresh `alpine-zfsboot verify` process).
     sync
     blockdev --rereadpt "${SYSDRIVE}" 2>/dev/null || true
 }
@@ -2034,94 +2128,35 @@ verify_installation() {
     test -f "${MOUNT_LOCATION}/boot/initramfs-${KERNEL_FLAVOR}" ||
         die "Missing Alpine initramfs."
 
+    # A real byte-for-byte comparison against the exact artifacts this
+    # run fetched, not just "does the file exist" - `alpine-zfsboot
+    # install` already did this same comparison once, synchronously,
+    # immediately after each write (dying on any mismatch before this
+    # script could even reach here) - this is a second, independent
+    # recheck via a fresh process (see install_alpine_zfsboot_bios()'s
+    # own comment on why: the in-kernel block-device cache and the
+    # sync/blockdev --rereadpt right after installing it). `verify` is
+    # the same read-only truth source `alpine-zfsboot status` itself is
+    # built on - one implementation, not a second one re-derived here in
+    # shell (see that repo's own cmd/tool/main.go doc comment).
+    #
+    # --firmware explicit here too, same reason as install's own
+    # --firmware: ${MOUNT_LOCATION}'s own /sys/firmware/efi isn't a real,
+    # live sysfs (this target hasn't booted yet), so `verify` cannot
+    # auto-detect firmware from it the way it correctly can on an
+    # already-booted system.
     if [ "${USE_UEFI}" = "yes" ]; then
-        test -f "${MOUNT_LOCATION}/boot/efi/EFI/BOOT/${EFI_FALLBACK_NAME}" ||
-            die "Missing alpine-zfsboot EFI executable."
+        alpine-zfsboot verify --root "${MOUNT_LOCATION}" --firmware uefi \
+            --efi-file "${WORKDIR}/alpine-zfsboot.EFI" ||
+            die "alpine-zfsboot verify reported a problem with the installed UEFI loader (see its own output just above)."
     else
-        # A real byte-for-byte comparison, not just "does dd claim
-        # success" - dd's own exit status says nothing about whether the
-        # target device actually accepted every byte (a partition too
-        # small, or a device that silently truncates writes, wouldn't
-        # necessarily make dd itself fail).
-        #
-        # On a mismatch, this dumps BOTH sides (expected vs. actual, hex)
-        # directly into THIS run's own log before dying - a real gap
-        # this used to have: a bare "was not written correctly" message
-        # gave no way to tell "wrote nothing at all" (all-zero disk
-        # content) from "wrote something, but wrong" from "read back
-        # stale/cached content" after the fact, since WORKDIR (holding
-        # the one-and-only local copy of the expected bytes) is gone by
-        # the time anyone can look - cleanup() removes it on the way out
-        # via the EXIT trap, on this exact failure path included. Neither
-        # ad-hoc investigation (re-deriving a path to compare against,
-        # asking the operator to hunt for one) shouldn't be necessary to
-        # diagnose the NEXT time this trips - this run's own log is
-        # self-contained instead.
-        check_disk_write() {
-            local expected_file="$1" actual_device="$2" expected_bytes="$3" label="$4"
-            local tmp_expected tmp_actual cmp_out offset window_start
-
-            # Fast path: cmp -n bounds the comparison to expected_bytes
-            # and reads both sides directly - no tmpfs copy of either
-            # side needed at all on the common (matching) case. The
-            # boot-blob comparison specifically is real-world tens of
-            # MB (the actual v0.1.0 release asset is ~72 MB); copying
-            # that TWICE into tmpfs (RAM, on a rescue initramfs) on
-            # every successful install, on top of the copy already
-            # sitting in WORKDIR, bought nothing.
-            if cmp -s -n "${expected_bytes}" "${expected_file}" "${actual_device}"; then
-                return 0
-            fi
-
-            # Mismatch - only now pay for local copies. Plain temp
-            # files, NOT process substitution (`<(...)`) - an earlier
-            # version of this used two `<(...)` per cmp call, confirmed
-            # a real, reproducible bug: `cmp` itself failing with
-            # "/dev/fd/NN: No such file or directory" - bash's
-            # process-substitution fds are not guaranteed to survive
-            # being read twice in a row across two SEPARATE cmp
-            # invocations (the fast-path check above, then this one for
-            # its own text output) the way a real regular file trivially
-            # does. This diagnostic exists to explain a real mismatch,
-            # not to add a second, different failure mode on top of it.
-            tmp_expected="$(mktemp)"
-            tmp_actual="$(mktemp)"
-            head -c "${expected_bytes}" "${expected_file}" > "${tmp_expected}"
-            head -c "${expected_bytes}" "${actual_device}" > "${tmp_actual}"
-
-            # A fixed-size preview from the very START of the range
-            # isn't enough (a real, confirmed miss: an earlier version
-            # of this dumped only the first 64 bytes, which matched
-            # exactly on a real failure whose actual divergence was
-            # further in - looked like a false alarm until stage1.bin
-            # was rebuilt locally and dumped in full by hand). `cmp`
-            # itself (no -s) reports the exact byte offset of the first
-            # real difference - a window AROUND that offset, not the
-            # whole range, since expected_bytes can be tens of millions
-            # for the boot-blob, where a full hex dump would flood this
-            # log for no benefit.
-            cmp_out="$(cmp "${tmp_expected}" "${tmp_actual}" 2>&1 || true)"
-            echo "MISMATCH: ${label} - ${cmp_out}" >&2
-            offset="$(printf '%s' "${cmp_out}" | sed -n 's/.*byte \([0-9][0-9]*\).*/\1/p')"
-            if [ -n "${offset}" ]; then
-                window_start=$(( offset > 32 ? offset - 32 : 0 ))
-                echo "MISMATCH: ${label} - expected, 64 bytes starting at offset ${window_start} (differing byte is ${offset}):" >&2
-                od -An -tx1 -v -j "${window_start}" -N 64 "${tmp_expected}" >&2
-                echo "MISMATCH: ${label} - actual, 64 bytes starting at offset ${window_start}:" >&2
-                od -An -tx1 -v -j "${window_start}" -N 64 "${tmp_actual}" >&2
-            fi
-            rm -f "${tmp_expected}" "${tmp_actual}"
-            return 1
-        }
-
-        check_disk_write "${WORKDIR}/stage1.bin" "${SYSDRIVE}" 440 "stage1" ||
-            die "stage1 was not written to ${SYSDRIVE} correctly (see the hex dump just above)."
-        check_disk_write "${WORKDIR}/stage2.bin" "${BIOS_BOOT_PARTITION}" \
-            "$(stat -c%s "${WORKDIR}/stage2.bin" 2>/dev/null || wc -c < "${WORKDIR}/stage2.bin")" "stage2" ||
-            die "stage2 was not written to ${BIOS_BOOT_PARTITION} correctly (see the hex dump just above)."
-        check_disk_write "${WORKDIR}/bootblob.img" "${BOOTBLOB_PARTITION}" \
-            "$(stat -c%s "${WORKDIR}/bootblob.img" 2>/dev/null || wc -c < "${WORKDIR}/bootblob.img")" "boot-blob" ||
-            die "boot-blob was not written to ${BOOTBLOB_PARTITION} correctly (see the hex dump just above)."
+        alpine-zfsboot verify --root "${MOUNT_LOCATION}" --firmware bios \
+            --stage1-file "${WORKDIR}/stage1.bin" \
+            --stage2-file "${WORKDIR}/stage2.bin" \
+            --kernel-file "${WORKDIR}/bios-kernel" \
+            --initrd-file "${WORKDIR}/bios-initrd" \
+            --cmdline-file "${WORKDIR}/bios-cmdline" ||
+            die "alpine-zfsboot verify reported a problem with the installed BIOS boot artifacts (see its own output just above)."
     fi
 
     test -f "${MOUNT_LOCATION}/etc/hostid" ||
