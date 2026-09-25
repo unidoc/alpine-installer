@@ -235,15 +235,15 @@ ZROOT_PASSPHRASE="${ZROOT_PASSPHRASE:-}"
 # keep in sync across both repos. All optional; nothing here is
 # required for a plain, non-rescue install.
 #
-# UEFI ONLY. There is no ESP at all in legacy BIOS mode (USE_UEFI=no) -
-# alpine-zfsboot's own /init reads this material from exactly one
-# place, a vfat filesystem labelled EFI carrying
-# /EFI/ALPINE/{config,authorized_keys,ssh_host_ed25519_key},
-# and BIOS mode's own disk layout never creates one (see this file's
-# own disk-layout comment). validate_environment() dies if any of
-# these are set together with USE_UEFI=no, rather than silently
-# writing nothing and reporting success - a real, confirmed gap in an
-# earlier version of this installer.
+# Available on every layout now, not UEFI only (unidoc-alip's PR #3
+# review, F7 - this comment was stale, left over from before alpine-
+# zfsboot's unified storage architecture): alpine-zfsboot's own /init
+# reads this material from exactly one place, a vfat filesystem
+# labelled EFI carrying /EFI/ALPINE/{config,authorized_keys,
+# ssh_host_ed25519_key}, and every layout (UEFI/GPT, BIOS/GPT, BIOS/
+# msdos) now carries that same canonical partition - see this file's
+# own disk-layout comment. validate_environment() no longer refuses
+# these settings under USE_UEFI=no; there is nothing left to refuse.
 #
 # ALPINE_ZFSBOOT_SSH_KEY is the one exception to the cmdline-mirror
 # rule above - it has no alpine-zfsboot.* cmdline equivalent at all.
@@ -327,8 +327,14 @@ ALPINE_ZFSBOOT_CHECKSUMS_URL="${ALPINE_ZFSBOOT_CHECKSUMS_URL:-https://github.com
 # org's own stated practice is `apk add alpine-zfsboot` (from unidoc-aports,
 # already carrying its own package) ahead of time, same as every other
 # required system command (sgdisk, dropbear, ...) - see require_command's
-# own apk_package_for_command() mapping. If it's ever genuinely missing,
-# require_command's own auto-`apk add` fallback handles it the same way.
+# own apk_package_for_command() mapping. require_command's own auto-`apk
+# add` fallback only helps if the HOST already has pkg.unidoc.io in its
+# own /etc/apk/repositories (unidoc-alip's PR #3 review, F3) - nothing
+# here adds it there, only to the TARGET's (write_base_config()). On a
+# stock rescue image, "ahead of time" above is a real prerequisite - see
+# the README's own quickstart for the exact commands. alpine-zfsboot's
+# own rescue environment already bundles the CLI, so this only matters
+# running from something else.
 
 ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
 
@@ -502,16 +508,6 @@ apk_package_for_command() {
         # let the same "just lump it in" mistake happen here too.
         sfdisk) echo "sfdisk" ;;
         partprobe) echo "parted" ;;
-        # dropbearkey ships in the plain "dropbear" package (confirmed
-        # against real Alpine 3.24 dropbear-*.apk contents, same package
-        # build.sh itself bundles into the rescue initramfs - see its own
-        # comment) - NOT assumed present just because this installer runs
-        # inside an alpine-zfsboot rescue environment: a stock Alpine
-        # rescue/netboot image (openssh, not dropbear) running this same
-        # installer script would otherwise die with "dropbearkey: not
-        # found" at the very last install step, after partitioning/pool
-        # creation/chroot install have all already happened.
-        dropbearkey) echo "dropbear" ;;
         # The alpine-zfsboot CLI itself - always installed via
         # `apk add alpine-zfsboot` from unidoc-aports in real use (the
         # org's own stated practice - never fetched fresh from GitHub
@@ -519,8 +515,10 @@ apk_package_for_command() {
         # installer no longer implements stage1/stage2/EFI-loader/FAT-
         # payload/config writing itself; it execs this binary (see
         # install_alpine_zfsboot_bios()/_uefi()) exactly like every
-        # other required system command above, auto-installed by this
-        # same require_command() mechanism if missing.
+        # other required system command above - though require_command's
+        # own auto-apk-add fallback only helps here if the host already
+        # has pkg.unidoc.io configured (see this variable's own top-of-
+        # file comment, F3).
         alpine-zfsboot) echo "alpine-zfsboot" ;;
         *) echo "" ;;
     esac
@@ -870,16 +868,24 @@ EOF
         require_command "sfdisk"
         require_command "blockdev"
     fi
-    # Only required when actually needed - a plain, non-rescue install
-    # (ALPINE_ZFSBOOT_SSH_KEY unset) must not fail or auto-install a
-    # package just because this ONE optional feature wasn't requested,
-    # same posture as the DISK_LAYOUT-gated pair above. No more USE_UEFI
-    # gate here - every layout has an EFI_PARTITION to persist rescue-SSH
-    # material to now (see this function's own comment above), not just
-    # UEFI installs.
-    if [ -n "${ALPINE_ZFSBOOT_SSH_KEY}" ]; then
-        require_command "dropbearkey"
-    fi
+
+    # require_command only checks that SOME alpine-zfsboot binary is on
+    # PATH, not which version - and the only documented source
+    # (pkg.unidoc.io) currently serves 0.1.0, which has no install/verify
+    # subcommand at all (only version/check/update). Without this probe,
+    # a stale or 0.1.0 host sails through validate_environment(), then
+    # partition_disk() -> create_zpool() -> fetch_rootfs() ->
+    # run_chroot_install() all run for real, and only THEN does
+    # `alpine-zfsboot install` fail with "unknown command \"install\"" -
+    # the disk left wiped, partitioned, with a pool and an OS, but no
+    # bootloader. Checking a capability instead of a version STRING is
+    # deliberate: the stamp differs by source (bare "0.1.0" from the
+    # APKBUILD, "v0.2.0" from release.yml, "dev" from a local build), so
+    # a string compare would need to special-case all three formats for
+    # no real benefit over just asking the binary what it can do.
+    alpine-zfsboot install --help >/dev/null 2>&1 &&
+        alpine-zfsboot verify --help >/dev/null 2>&1 ||
+        die "alpine-zfsboot on this host ($(alpine-zfsboot --version 2>/dev/null || echo "unknown version")) has no install/verify subcommands - it needs 0.2.0 or newer (apk upgrade alpine-zfsboot)."
 
     getent hosts dl-cdn.alpinelinux.org >/dev/null 2>&1 ||
         die "Unable to resolve dl-cdn.alpinelinux.org."
@@ -1000,14 +1006,28 @@ select_zfsboot_artifacts() {
 # Pinning the URLs resolved here to one tag keeps that ordering intact
 # while closing the actual consistency gap.
 pin_zfsboot_release_urls() {
-    local tag api_response pinned var current
+    local tag tag_url pinned var current
 
     log "Resolving alpine-zfsboot's latest release (pinning every default download URL to one tag)"
-    api_response="$(curl --fail --silent --location "https://api.github.com/repos/unidoc/alpine-zfsboot/releases/latest")" ||
-        die "Could not resolve alpine-zfsboot's latest release via the GitHub API (api.github.com/repos/unidoc/alpine-zfsboot/releases/latest) - check network connectivity, or set the ALPINE_ZFSBOOT_*_FILE/_URL overrides for what you need to skip this lookup entirely."
-    tag="$(printf '%s' "${api_response}" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
-    [ -n "${tag}" ] ||
-        die "Could not find a tag_name field in the GitHub API response for alpine-zfsboot's latest release - the response may be malformed, or the API's own shape may have changed."
+    # Resolved from the plain /releases/latest redirect, NOT the
+    # api.github.com REST API (unidoc-alip's PR #3 review, F5) -
+    # unauthenticated API calls are limited to 60/hour per source IP,
+    # and a rescue network behind a shared NAT can hit that on its own,
+    # turning an install that used to work into one that dies here with
+    # no disk touched yet. The plain releases/latest/download/... URLs
+    # this whole function replaces already relied on this exact same
+    # redirect working - this just reads the tag out of where that
+    # redirect actually lands instead of also calling a second, rate-
+    # limited endpoint to learn the same fact.
+    tag_url="$(curl --fail --silent --location --head --output /dev/null \
+        --write-out '%{url_effective}' "https://github.com/unidoc/alpine-zfsboot/releases/latest")" ||
+        die "Could not resolve alpine-zfsboot's latest release (github.com/unidoc/alpine-zfsboot/releases/latest did not redirect as expected) - check network connectivity, or set the ALPINE_ZFSBOOT_*_FILE/_URL overrides for what you need to skip this lookup entirely."
+    tag="${tag_url##*/releases/tag/}"
+    case "${tag}" in
+        ''|*/*)
+            die "Could not resolve alpine-zfsboot's latest release - releases/latest redirected to an unexpected URL (${tag_url})."
+            ;;
+    esac
     log "alpine-zfsboot latest release: ${tag}"
 
     pinned="https://github.com/unidoc/alpine-zfsboot/releases/download/${tag}/"
@@ -1996,8 +2016,10 @@ run_chroot_install() {
 # initramfs + cmdline all bundled into one PE/COFF file by its own build.sh
 # - see that repo) - just copy it onto the ESP at the standard removable-
 # media fallback path, no separate kernel/initramfs files or NVRAM boot
-# entry needed at all. A backup copy under a fixed name too - cheap
-# insurance if the primary copy is ever damaged in place.
+# entry needed at all. No `.backup` copy from `install` itself (unidoc-
+# alip's PR #3 review, F7 - an earlier version of this comment claimed
+# one; v0.2.0's `install` writes none - only `update` keeps a
+# `.previous` copy, and only once there's a prior install to back up).
 install_alpine_zfsboot_uefi() {
     zfsboot_config_args
     alpine-zfsboot install "${SYSDRIVE}" \
@@ -2007,29 +2029,36 @@ install_alpine_zfsboot_uefi() {
     sync
 }
 
-# Per-machine alpine-zfsboot settings (rescue ssh_key, static network,
-# ...), read by /init at every boot and merged into its own cmdline
-# parsing - cmdline always wins over this file (see init/init's own
-# comment on why: a bad persisted setting must stay overridable for one
-# boot, never a permanent lock-out). Nothing written for a setting that
-# was never set here - an empty `alpine-zfsboot.net=` line would parse
-# as a real (if useless) override, not "no opinion", so absent keys
-# have to stay genuinely absent, not present-with-an-empty-value.
+# What ends up on the ESP (unidoc-alip's PR #3 review, F7: this used
+# to be write_alpine_zfsboot_esp_config()'s own header comment, sitting
+# on top of a function that wrote these files directly in shell - that
+# function is gone, `alpine-zfsboot install` writes them now, see
+# below - but the facts about the FILES THEMSELVES are still accurate
+# and worth keeping): per-machine alpine-zfsboot settings (rescue
+# ssh_key, static network, ...) go in a plain-data config file, read by
+# /init at every boot and merged into its own cmdline parsing - cmdline
+# always wins over this file (see init/init's own comment on why: a bad
+# persisted setting must stay overridable for one boot, never a
+# permanent lock-out). Nothing written for a setting that was never set
+# - an empty `alpine-zfsboot.net=` line would parse as a real (if
+# useless) override, not "no opinion", so absent keys have to stay
+# genuinely absent, not present-with-an-empty-value.
 #
-# Plain data, one `key=value` per line - /init deliberately does NOT
-# source this file as a script, only ever matches it against the same
-# whitelist of alpine-zfsboot.* keys /proc/cmdline itself is parsed
-# against, so its content can never execute regardless of what it
-# contains. Written unencrypted onto a FAT partition (the ESP has no
-# other option) - network settings and (via the two sibling files this
-# function also writes below) public key material and this machine's
-# own SSH host PRIVATE key. That private key being on an unencrypted,
-# pre-boot-readable partition is an accepted, deliberate tradeoff (it
-# must be readable before anything else on this machine is unlocked),
-# not an oversight - but it means this ESP is no longer "nothing secret
-# here", and physical/firmware-level access to it is equivalent to
-# extracting this machine's rescue SSH host identity. NEVER
-# ZROOT_PASSPHRASE or anything else secret beyond that goes here.
+# One `key=value` per line - /init deliberately does NOT source this
+# file as a script, only ever matches it against the same whitelist of
+# alpine-zfsboot.* keys /proc/cmdline itself is parsed against, so its
+# content can never execute regardless of what it contains. Written
+# unencrypted onto a FAT partition (the ESP has no other option) -
+# network settings and (in its own sibling files) public key material
+# and this machine's own SSH host PRIVATE key. That private key being
+# on an unencrypted, pre-boot-readable partition is an accepted,
+# deliberate tradeoff (it must be readable before anything else on this
+# machine is unlocked), not an oversight - but it means this ESP is no
+# longer "nothing secret here", and physical/firmware-level access to
+# it is equivalent to extracting this machine's rescue SSH host
+# identity. NEVER ZROOT_PASSPHRASE or anything else secret beyond that
+# goes here.
+#
 # zfsboot_config_args populates the global ZFSBOOT_CONFIG_ARGS array with
 # whichever --ssh-key/--net/--ipv4*/--ipv6*/--ssh-* flags this install
 # actually needs, one per set ALPINE_ZFSBOOT_* env var - shared by both
@@ -2145,13 +2174,45 @@ verify_installation() {
     # live sysfs (this target hasn't booted yet), so `verify` cannot
     # auto-detect firmware from it the way it correctly can on an
     # already-booted system.
+    #
+    # --root has NO effect on which ESP verify actually checks
+    # (unidoc-alip's PR #3 review, F4 - a real gap in alpine-zfsboot
+    # itself, not this script): unlike `install`, which resolves the ESP
+    # via --root/boot/efi and checks it against the target disk, `verify`
+    # always finds the ESP host-wide via FindESP() - a scan of every
+    # device on the system for a FAT32 volume labelled EFI carrying the
+    # right marker files, refusing if more than one qualifies. On a host
+    # with another attached disk that also carries an alpine-zfsboot ESP
+    # (a disk replacement, reinstalling one of a pair), this call can
+    # fail on a CORRECT install ("more than one alpine-zfsboot ESP found
+    # - refusing to guess"), or in principle verify the WRONG disk's ESP
+    # if this target's own doesn't happen to qualify. Real fix belongs
+    # upstream (verify/status honoring --root the way install does) -
+    # nothing to work around here without reimplementing ESP discovery
+    # in this script, which is exactly the duplication this whole PR
+    # exists to remove.
     if [ "${USE_UEFI}" = "yes" ]; then
         alpine-zfsboot verify --root "${MOUNT_LOCATION}" --firmware uefi \
             --efi-file "${WORKDIR}/alpine-zfsboot.EFI" ||
             die "alpine-zfsboot verify reported a problem with the installed UEFI loader (see its own output just above)."
     else
+        # alpine-zfsboot v0.2.0's `verify --stage1-file` compares the
+        # given file's bytes EXACTLY against the on-disk 440-byte boot-
+        # code region - it does not trim a full 512-byte sector itself
+        # the way `install` does internally (unidoc/alpine-zfsboot#9,
+        # still open as of this writing). The real release asset
+        # (${WORKDIR}/stage1.bin) is the full 512-byte MBR sector -
+        # handing it to `verify` as-is makes every single BIOS install
+        # fail this check with "want is 512 bytes, expected exactly
+        # 440", even though `install` already wrote the correct 440-byte
+        # region and this script's own separate checksum verification
+        # already confirmed the download is genuine. Trim here, the same
+        # 440 bytes `install` itself writes, so `verify` compares like
+        # for like. Safe to remove once #9 ships and `verify --stage1-file`
+        # accepts a raw 512-byte sector the same way `install` does.
+        head -c 440 "${WORKDIR}/stage1.bin" > "${WORKDIR}/stage1-code.bin"
         alpine-zfsboot verify --root "${MOUNT_LOCATION}" --firmware bios \
-            --stage1-file "${WORKDIR}/stage1.bin" \
+            --stage1-file "${WORKDIR}/stage1-code.bin" \
             --stage2-file "${WORKDIR}/stage2.bin" \
             --kernel-file "${WORKDIR}/bios-kernel" \
             --initrd-file "${WORKDIR}/bios-initrd" \

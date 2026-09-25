@@ -14,6 +14,19 @@ away from undone, which a plain ext4 root just can't offer. Reach for
 non-standard partition layout, or want to avoid ZFS's operational model
 (licensing questions, unfamiliarity, a target that doesn't suit it).
 
+`alpine-install-zfs.sh` needs the `alpine-zfsboot` CLI (0.2.0 or newer)
+already on the rescue host's own `PATH` first - see "The `alpine-zfsboot`
+CLI itself" below for why it's a prerequisite rather than something this
+script fetches. On a stock rescue image that isn't already
+alpine-zfsboot's own rescue environment (which bundles it):
+
+```sh
+branch="v$(cut -d. -f1,2 < /etc/alpine-release)"
+echo "https://pkg.unidoc.io/${branch}/main" >> /etc/apk/repositories
+curl -o /etc/apk/keys/unidoc-aports.rsa.pub https://pkg.unidoc.io/keys/unidoc-aports.rsa.pub
+apk update && apk add alpine-zfsboot
+```
+
 ```sh
 wget https://raw.githubusercontent.com/unidoc/alpine-installer/master/alpine-install-zfs.sh
 chmod +x alpine-install-zfs.sh
@@ -236,9 +249,15 @@ Unlike every other artifact above, this is **not** fetched from GitHub at
 install time - it's a required system command, exactly like `sgdisk` or
 `dropbear` (see `apk_package_for_command()`/`require_command()`): install
 it ahead of time with `apk add alpine-zfsboot` (already packaged in
-`unidoc-aports`), and this script just calls it by name. If it's genuinely
-missing, `require_command()`'s own `apk add` fallback installs it
-automatically, same as any other required command.
+`unidoc-aports`), and this script just calls it by name.
+`require_command()`'s own `apk add` fallback only helps if the *host's*
+`/etc/apk/repositories` already lists `pkg.unidoc.io` - this script adds
+that repository to the *target's* `/etc/apk/repositories`
+(`write_base_config()`), never the rescue host's own, so on a stock
+rescue image "install it ahead of time" above is a real prerequisite, not
+just a suggestion - see the quickstart at the top of this README for the
+exact commands. alpine-zfsboot's own rescue environment already bundles
+the CLI, so this only matters when running from something else.
 
 Once installed, the same binary is the ongoing management interface for
 that machine's own alpine-zfsboot boot environment - `alpine-zfsboot
