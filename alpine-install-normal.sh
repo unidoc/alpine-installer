@@ -63,18 +63,26 @@ ALPINE_BRANCH=""
 # specific release instead.
 ALPINE_VERSION="${ALPINE_VERSION:-}"
 
-# "auto" (default) checks the rescue system's OWN kernel command line
-# for console=ttyS0 (x86_64) / console=ttyAMA0 (aarch64) - see
-# detect_serial() below. Deliberately not "check the live tty" (e.g.
-# `tty` or $SSH_TTY): if this rescue session is reached over SSH, the
-# controlling tty is a pts that says nothing about which physical/
-# remote-console channel will actually be available after reboot, since
-# SSH isn't available that early in boot. What the rescue kernel itself
-# was told to use as a console is a much better signal - a bare-metal/
-# VPS host with no VGA almost always has its rescue image booted with
-# console=ttyS0 for exactly the same reason the installed system will
-# need it too. Still a heuristic - force "yes"/"no" if you already know.
-USE_SERIAL="${USE_SERIAL:-auto}"
+# The one source of truth for this install's console output - device
+# name only (tty0/ttyS0/ttyAMA0), same vocabulary alpine-zfsboot's own
+# ALPINE_ZFSBOOT_CONSOLE uses, even though this script has no
+# alpine-zfsboot boot menu to actually unify with (hence a separate
+# variable, not that one). "auto" (default) checks the rescue system's
+# OWN kernel command line for console=ttyS0 (x86_64) / console=ttyAMA0
+# (aarch64) - see detect_console_output() below. Deliberately not "check
+# the live tty" (e.g. `tty` or $SSH_TTY): if this rescue session is
+# reached over SSH, the controlling tty is a pts that says nothing about
+# which physical/remote-console channel will actually be available
+# after reboot, since SSH isn't available that early in boot. What the
+# rescue kernel itself was told to use as a console is a much better
+# signal - a bare-metal/VPS host with no VGA almost always has its
+# rescue image booted with console=ttyS0 for exactly the same reason the
+# installed system will need it too. Still a heuristic - set this
+# explicitly (tty0, ttyS0, or ttyAMA0) if you already know, or if the
+# rescue session's own console genuinely differs from the target
+# machine's real one (e.g. installing over a QEMU/IPMI serial rescue
+# console onto a machine that itself has a VGA/tty0 console).
+CONSOLE_OUTPUT="${CONSOLE_OUTPUT:-auto}"
 USE_UEFI="${USE_UEFI:-auto}"
 
 # "auto" (default) guesses from a CPUID hypervisor flag / ARM hypervisor
@@ -278,22 +286,47 @@ detect_virt() {
     return 1
 }
 
-# Best-effort: see the USE_SERIAL comment above for why this checks the
-# rescue system's own boot-time console= setting rather than the live
-# tty.
-detect_serial() {
+# Best-effort: see the CONSOLE_OUTPUT comment above for why this checks
+# the rescue system's own boot-time console= setting rather than the
+# live tty. Leaves CONSOLE_OUTPUT untouched if it's already set to
+# anything other than "auto"/empty (an explicit operator choice always
+# wins).
+detect_console_output() {
+    case "${CONSOLE_OUTPUT}" in
+        ""|auto) ;;
+        *) return 0 ;;
+    esac
+    # Prefers $ALPINE_ZFSBOOT_ACTIVE_TTY (exported by alpine-zfsboot's
+    # own /init, inherited into whatever shell it runs this installer
+    # from) over the cmdline check below, when it's set to something
+    # this script actually knows how to wire up - it's the
+    # already-resolved real answer, not a guess. Falls through to the
+    # cmdline check instead of dying outright if it names a console this
+    # script has no GRUB/inittab wiring for (e.g. ttyS1/ttyS2 -
+    # alpine-zfsboot can listen on those, this script only ever supports
+    # one serial device per arch).
+    case "${ALPINE_ZFSBOOT_ACTIVE_TTY:-}" in
+        tty0|ttyS0|ttyAMA0)
+            CONSOLE_OUTPUT="${ALPINE_ZFSBOOT_ACTIVE_TTY}"
+            return 0
+            ;;
+    esac
     local cmdline serial_dev
-    [ -r /proc/cmdline ] || return 1
-    cmdline="$(cat /proc/cmdline)"
     case "${ARCH}" in
-        x86_64) serial_dev="ttyS" ;;
-        aarch64) serial_dev="ttyAMA" ;;
-        *) return 1 ;;
+        x86_64) serial_dev="ttyS0" ;;
+        aarch64) serial_dev="ttyAMA0" ;;
+        *) serial_dev="" ;;
     esac
-    case " ${cmdline} " in
-        *" console=${serial_dev}"*) return 0 ;;
-        *) return 1 ;;
-    esac
+    if [ -n "${serial_dev}" ] && [ -r /proc/cmdline ]; then
+        cmdline="$(cat /proc/cmdline)"
+        case " ${cmdline} " in
+            *" console=${serial_dev}"*)
+                CONSOLE_OUTPUT="${serial_dev}"
+                return 0
+                ;;
+        esac
+    fi
+    CONSOLE_OUTPUT="tty0"
 }
 
 # ==============================================================================
@@ -361,25 +394,27 @@ EOF
             ;;
     esac
 
-    case "${USE_SERIAL}" in
-        auto)
-            if detect_serial; then
-                USE_SERIAL="yes"
-            else
-                USE_SERIAL="no"
-            fi
-            log "USE_SERIAL=auto detected USE_SERIAL=${USE_SERIAL}"
+    detect_console_output
+    case "${CONSOLE_OUTPUT}" in
+        tty0) ;;
+        ttyS0)
+            [ "${ARCH}" = "x86_64" ] ||
+                die "CONSOLE_OUTPUT=ttyS0 is only valid on x86_64 - aarch64's serial console is ttyAMA0."
             ;;
-        yes|no) ;;
-        # Not just an enum check: USE_SERIAL's value is spliced verbatim
-        # into the unquoted heredoc that generates chroot-install-script.sh
-        # (see write_chroot_install_script()) and later executed as root
-        # inside the chroot. An unvalidated value there is a real command
-        # injection, not just a bad-input inconvenience - resolving
-        # "auto" to a literal yes/no above, before this check, keeps
-        # that guarantee intact.
-        *) die "Unsupported USE_SERIAL: ${USE_SERIAL}. Supported values: auto, yes, and no." ;;
+        ttyAMA0)
+            [ "${ARCH}" = "aarch64" ] ||
+                die "CONSOLE_OUTPUT=ttyAMA0 is only valid on aarch64 - x86_64's serial console is ttyS0."
+            ;;
+        # Not just an enum check: CONSOLE_OUTPUT's value is spliced
+        # verbatim into the unquoted heredoc that generates
+        # chroot-install-script.sh (see write_chroot_install_script())
+        # and later executed as root inside the chroot. An unvalidated
+        # value there is a real command injection, not just a bad-input
+        # inconvenience - resolving "auto" to a literal device name
+        # above, before this check, keeps that guarantee intact.
+        *) die "Unsupported CONSOLE_OUTPUT: ${CONSOLE_OUTPUT}. Supported values: auto, tty0, ttyS0 (x86_64), and ttyAMA0 (aarch64)." ;;
     esac
+    log "CONSOLE_OUTPUT resolved to: ${CONSOLE_OUTPUT}"
 
     case "${VIRT}" in
         auto)
@@ -660,16 +695,18 @@ EOF
 
 write_bootloader_config() {
     log "Preparing GRUB configuration"
-    local grub_linux_normal grub_linux_serial
-    grub_linux_normal="net.ifnames=0 modules=virtio_mmio,usbkbd,ext4 rootfstype=ext4"
-    grub_linux_serial="${grub_linux_normal} console=ttyS0,115200n8"
+    local grub_linux_normal grub_linux_serial base
 
+    base="net.ifnames=0 modules=virtio_mmio,usbkbd,ext4 rootfstype=ext4"
     if [ "${ARCH}" = "aarch64" ]; then
-        # No serial console handling for aarch64 here; fall back to tty0/ttyAMA0.
-        grub_linux_normal="${grub_linux_normal} console=ttyAMA0 console=tty0"
+        grub_linux_normal="${base} console=ttyAMA0 console=tty0"
+        grub_linux_serial="${base} console=ttyAMA0,115200n8"
+    else
+        grub_linux_normal="${base}"
+        grub_linux_serial="${base} console=ttyS0,115200n8"
     fi
 
-    if [ "${USE_SERIAL}" = "yes" ]; then
+    if [ "${CONSOLE_OUTPUT}" = "ttyS0" ] || [ "${CONSOLE_OUTPUT}" = "ttyAMA0" ]; then
         cat > "${MOUNT_LOCATION}/root/grub.conf" <<EOF
 GRUB_DEFAULT=0
 GRUB_TIMEOUT=5
@@ -718,7 +755,7 @@ EOF
     fi
     cat >> "${MOUNT_LOCATION}/etc/fstab" <<'EOF'
 proc /proc proc defaults,hidepid=2 0 0
-tmpfs /tmp tmpfs defaults,nosuid,nodev 0 0
+tmpfs /tmp tmpfs defaults,nosuid,nodev,size=1G 0 0
 EOF
 
     if [ "${USE_UEFI}" = "yes" ]; then
@@ -914,8 +951,8 @@ chmod 0644 /etc/ssh/sshd_config.d/local.conf
 
 getent passwd sshd >/dev/null || adduser -h / -s /sbin/nologin -S sshd
 
-if [ "${USE_SERIAL}" = "yes" ]; then
-    sed -i '/^[#]\\?ttyS0/s/^#//' /etc/inittab
+if [ "${CONSOLE_OUTPUT}" = "ttyS0" ] || [ "${CONSOLE_OUTPUT}" = "ttyAMA0" ]; then
+    sed -i "/^[#]\\?${CONSOLE_OUTPUT}/s/^#//" /etc/inittab
 fi
 
 rm -f /chroot-install-script.sh

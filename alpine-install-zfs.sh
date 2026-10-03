@@ -143,20 +143,6 @@ ALPINE_VERSION="${ALPINE_VERSION:-}"
 POOL_NAME="${POOL_NAME:-zroot}"
 ROOT_DATASET="${POOL_NAME}/ROOT/alpine"
 MOUNT_LOCATION="/mnt/alpine"
-
-# "auto" (default) checks the rescue system's OWN kernel command line
-# for console=ttyS0 (x86_64) / console=ttyAMA0 (aarch64) - see
-# detect_serial() below. Deliberately not "check the live tty" (e.g.
-# `tty` or $SSH_TTY): if this rescue session is reached over SSH, the
-# controlling tty is a pts that says nothing about which physical/
-# remote-console channel will actually be available to interact with
-# alpine-zfsboot's own menu after reboot, since SSH isn't available that
-# early in boot. What the rescue kernel itself was told to use as a console
-# is a much better signal - a bare-metal/VPS host with no VGA almost always
-# has its rescue image booted with console=ttyS0 for exactly the same
-# reason the installed system will need it too. Still a heuristic -
-# force "yes"/"no" if you already know.
-USE_SERIAL="${USE_SERIAL:-auto}"
 SWAP_SIZE_GIB="${SWAP_SIZE_GIB:-2}"
 
 # "auto" (default) guesses from a CPUID hypervisor flag / ARM
@@ -273,9 +259,37 @@ ALPINE_ZFSBOOT_IPV6_GATEWAY="${ALPINE_ZFSBOOT_IPV6_GATEWAY:-}"
 ALPINE_ZFSBOOT_SSH_LISTEN="${ALPINE_ZFSBOOT_SSH_LISTEN:-}"
 ALPINE_ZFSBOOT_SSH_PORT="${ALPINE_ZFSBOOT_SSH_PORT:-}"
 ALPINE_ZFSBOOT_SSH_ALLOW="${ALPINE_ZFSBOOT_SSH_ALLOW:-}"
+# The ONE source of truth for console output, both for alpine-zfsboot's
+# own persisted boot-menu console (alpine-zfsboot.console=, via
+# --console below) AND for whether the INSTALLED system gets a getty
+# enabled on ttyS0/ttyAMA0 (see write_chroot_install_script() below) -
+# unifies what used to be two separate variables with two separate,
+# sometimes-disagreeing detection heuristics (ALPINE_ZFSBOOT_CONSOLE
+# itself, and a cruder yes/no USE_SERIAL with its own detect_serial()).
+# "auto" (default, same as leaving this unset) - detect_console_pref()
+# (called from validate_environment() below, early, before anything
+# that needs the resolved value) fills this in from the REAL console
+# this installer is actually running on. Set explicitly (e.g. "tty0" or
+# "ttyS0,115200n8") to override detection outright - detect_console_pref()
+# never touches an already-set value. The real reason this needs to be
+# overridable, not just auto-detected: installing over a serial rescue
+# console (QEMU/IPMI SOL) for a machine that will itself boot on tty0
+# (or vice versa) - auto-detection sees only the RESCUE session's own
+# console, which can genuinely differ from the target's real one. See
+# detect_console_pref()'s own comment for the Netcup incident that
+# motivated auto-detection in the first place.
+ALPINE_ZFSBOOT_CONSOLE="${ALPINE_ZFSBOOT_CONSOLE:-auto}"
+
+# The alpine-zfsboot CLI this script drives (install/verify). Empty (the
+# default) means: /boot/alpine-zfsboot if present - the binary that ships
+# inside the alpine-zfsboot image this rescue session booted from, which is
+# the one that should install the system - else whatever is on PATH (see
+# require_alpine_zfsboot()). Set it to use a specific binary instead; an
+# explicit value is never replaced.
+ALPINE_ZFSBOOT_BIN="${ALPINE_ZFSBOOT_BIN:-}"
 
 # alpine-zfsboot artifacts - defaults point at alpine-zfsboot's own real
-# GitHub release now (v0.1.0 shipped). releases/latest/download/... is
+# GitHub releases. releases/latest/download/... is
 # deliberately what both repos use, not a pinned version tag: asset
 # filenames are arch-based and unversioned by design (see the
 # alpine-zfsboot repo's own release.yml comment), so this URL never needs
@@ -508,18 +522,6 @@ apk_package_for_command() {
         # let the same "just lump it in" mistake happen here too.
         sfdisk) echo "sfdisk" ;;
         partprobe) echo "parted" ;;
-        # The alpine-zfsboot CLI itself - always installed via
-        # `apk add alpine-zfsboot` from unidoc-aports in real use (the
-        # org's own stated practice - never fetched fresh from GitHub
-        # at install time), same package name as the command. This
-        # installer no longer implements stage1/stage2/EFI-loader/FAT-
-        # payload/config writing itself; it execs this binary (see
-        # install_alpine_zfsboot_bios()/_uefi()) exactly like every
-        # other required system command above - though require_command's
-        # own auto-apk-add fallback only helps here if the host already
-        # has pkg.unidoc.io configured (see this variable's own top-of-
-        # file comment, F3).
-        alpine-zfsboot) echo "alpine-zfsboot" ;;
         *) echo "" ;;
     esac
 }
@@ -537,6 +539,31 @@ require_command() {
 
     command -v "$1" >/dev/null 2>&1 ||
         die "Missing required command: $1${pkg:+ (tried apk add ${pkg}, still missing - check network/apk repositories)}"
+}
+
+# Finds the alpine-zfsboot CLI and sets ALPINE_ZFSBOOT_BIN to it. Order: an
+# explicit ALPINE_ZFSBOOT_BIN (must itself exist), then /boot/alpine-zfsboot
+# (the binary that came with the booted image), then PATH. Never installed
+# automatically - that is the operator's call (apk add alpine-zfsboot).
+require_alpine_zfsboot() {
+    if [ -n "${ALPINE_ZFSBOOT_BIN}" ]; then
+        command -v "${ALPINE_ZFSBOOT_BIN}" >/dev/null 2>&1 ||
+            die "ALPINE_ZFSBOOT_BIN=${ALPINE_ZFSBOOT_BIN} is not an executable command."
+        return 0
+    fi
+
+    if [ -x /boot/alpine-zfsboot ]; then
+        ALPINE_ZFSBOOT_BIN="/boot/alpine-zfsboot"
+        log "Using ${ALPINE_ZFSBOOT_BIN} (the binary shipped with this image)"
+        return 0
+    fi
+
+    if command -v alpine-zfsboot >/dev/null 2>&1; then
+        ALPINE_ZFSBOOT_BIN="alpine-zfsboot"
+        return 0
+    fi
+
+    die "Missing required command: alpine-zfsboot (not at /boot/alpine-zfsboot and not on PATH). Install it (apk add alpine-zfsboot) or set ALPINE_ZFSBOOT_BIN to its path."
 }
 
 wait_for_device() {
@@ -633,44 +660,6 @@ detect_virt() {
         fi
     done
     return 1
-}
-
-# Best-effort: see the USE_SERIAL comment above for why this checks the
-# rescue system's own boot-time console= setting rather than the live
-# tty.
-#
-# $ALPINE_ZFSBOOT_ACTIVE_TTY (exported by alpine-zfsboot's own /init,
-# inherited into whatever shell it's running the installer from) is
-# checked FIRST when present, not the cmdline grep below - this
-# project's own cmdline always lists BOTH console=tty0 and
-# console=ttyAMA*/ttyS* together, by design (see build.sh's own
-# CONSOLE_CMDLINE comment), so a plain "is ttyAMA on the cmdline" grep
-# is structurally always-true on any alpine-zfsboot-booted rescue
-# system regardless of which console the operator is actually watching
-# - confirmed the hard way on a real Hetzner CAX install (VGA operator,
-# still detected USE_SERIAL=yes). ALPINE_ZFSBOOT_ACTIVE_TTY is the same
-# value select_console() already resolved for exactly this question -
-# reuse it instead of re-deriving a wrong answer independently. The
-# cmdline-grep fallback stays for the non-alpine-zfsboot rescue case
-# (a stock Alpine ISO, no ALPINE_ZFSBOOT_ACTIVE_TTY set at all) this
-# heuristic was presumably written for originally.
-detect_serial() {
-    local cmdline serial_dev
-    case "${ALPINE_ZFSBOOT_ACTIVE_TTY:-}" in
-        tty0) return 1 ;;
-        ttyAMA*|ttyS*) return 0 ;;
-    esac
-    [ -r /proc/cmdline ] || return 1
-    cmdline="$(cat /proc/cmdline)"
-    case "${ARCH}" in
-        x86_64) serial_dev="ttyS" ;;
-        aarch64) serial_dev="ttyAMA" ;;
-        *) return 1 ;;
-    esac
-    case " ${cmdline} " in
-        *" console=${serial_dev}"*) return 0 ;;
-        *) return 1 ;;
-    esac
 }
 
 # ==============================================================================
@@ -804,18 +793,22 @@ EOF
             ;;
     esac
 
-    case "${USE_SERIAL}" in
-        auto)
-            if detect_serial; then
-                USE_SERIAL="yes"
-            else
-                USE_SERIAL="no"
-            fi
-            log "USE_SERIAL=auto detected USE_SERIAL=${USE_SERIAL}"
-            ;;
-        yes|no) ;;
-        *) die "Unsupported USE_SERIAL: ${USE_SERIAL}. Supported values: auto, yes, and no." ;;
-    esac
+    # Resolved here, early - not just right before the --console flag is
+    # built in zfsboot_config_args() - so write_chroot_install_script()
+    # (which needs the same answer, for the installed system's own
+    # getty) sees it already settled too. detect_console_pref() itself
+    # leaves ALPINE_ZFSBOOT_CONSOLE untouched if the operator already
+    # set it to anything other than "auto".
+    detect_console_pref
+    log "ALPINE_ZFSBOOT_CONSOLE resolved to: ${ALPINE_ZFSBOOT_CONSOLE:-(unset, falls back to the tty0 default)}"
+    # Same set `alpine-zfsboot install --console` accepts (espconfig.
+    # ValidateConsole): checked HERE, before any disk is touched - the
+    # install step that would reject it runs long after partitioning, and
+    # a rejected value there leaves a wiped disk with no bootloader.
+    if [ -n "${ALPINE_ZFSBOOT_CONSOLE}" ] &&
+        ! [[ "${ALPINE_ZFSBOOT_CONSOLE}" =~ ^(tty0|ttyS[012]|ttyAMA0)(,[0-9]+[neo]?[5-8]?r?)?$ ]]; then
+        die "Unsupported ALPINE_ZFSBOOT_CONSOLE: ${ALPINE_ZFSBOOT_CONSOLE}. Use auto, tty0, ttyS0, ttyS1, ttyS2 or ttyAMA0, optionally followed by ,<baud>[n|e|o][5-8][r] (e.g. ttyS0,115200n8)."
+    fi
 
     if [ "${USE_UEFI}" = "yes" ]; then
         [ -d /sys/firmware/efi ] || die "The rescue system was not booted in UEFI mode."
@@ -857,8 +850,10 @@ EOF
         apk add --quiet blkid >/dev/null 2>&1 || true
     fi
 
+    require_alpine_zfsboot
+
     for command in \
-        alpine-zfsboot awk blkid chroot curl getent grep install lsblk mkfs.vfat mktemp \
+        awk blkid chroot curl getent grep install lsblk mkfs.vfat mktemp \
         modprobe mount mountpoint mkswap od partprobe sha256sum sgdisk tar \
         tr umount wipefs zfs zgenhostid zpool
     do
@@ -883,9 +878,18 @@ EOF
     # APKBUILD, "v0.2.0" from release.yml, "dev" from a local build), so
     # a string compare would need to special-case all three formats for
     # no real benefit over just asking the binary what it can do.
-    alpine-zfsboot install --help >/dev/null 2>&1 &&
-        alpine-zfsboot verify --help >/dev/null 2>&1 ||
-        die "alpine-zfsboot on this host ($(alpine-zfsboot --version 2>/dev/null || echo "unknown version")) has no install/verify subcommands - it needs 0.2.0 or newer (apk upgrade alpine-zfsboot)."
+    "${ALPINE_ZFSBOOT_BIN}" install --help >/dev/null 2>&1 &&
+        "${ALPINE_ZFSBOOT_BIN}" verify --help >/dev/null 2>&1 ||
+        die "alpine-zfsboot on this host ($("${ALPINE_ZFSBOOT_BIN}" --version 2>/dev/null || echo "unknown version")) has no install/verify subcommands - it needs 0.2.0 or newer (apk upgrade alpine-zfsboot)."
+
+    # `install --console` only exists in alpine-zfsboot releases newer than
+    # 0.3.0. Silently dropping the flag would leave the console unpersisted
+    # - exactly the lockout the console setting exists to prevent - so
+    # refuse up front, before any disk is touched.
+    if [ -n "${ALPINE_ZFSBOOT_CONSOLE}" ] &&
+        ! "${ALPINE_ZFSBOOT_BIN}" install --help 2>&1 | grep -q -- '--console'; then
+        die "alpine-zfsboot on this host ($("${ALPINE_ZFSBOOT_BIN}" --version 2>/dev/null || echo "unknown version")) has no 'install --console' - needs a release newer than 0.3.0 (apk upgrade alpine-zfsboot)."
+    fi
 
     getent hosts dl-cdn.alpinelinux.org >/dev/null 2>&1 ||
         die "Unable to resolve dl-cdn.alpinelinux.org."
@@ -1679,7 +1683,7 @@ write_fstab() {
     fi
     cat >> "${MOUNT_LOCATION}/etc/fstab" <<'EOF'
 proc /proc proc defaults,hidepid=2 0 0
-tmpfs /tmp tmpfs defaults,nosuid,nodev 0 0
+tmpfs /tmp tmpfs defaults,nosuid,nodev,size=1G 0 0
 EOF
 }
 
@@ -1723,6 +1727,18 @@ mount_chroot_filesystems() {
 }
 
 write_chroot_install_script() {
+    # The bare tty name only (strip a ",<baud><parity><bits>" suffix,
+    # same shape alpine-zfsboot's own _parse_console_spec splits on) -
+    # drives the installed system's own getty enable below, derived
+    # from the SAME resolved ALPINE_ZFSBOOT_CONSOLE this install also
+    # persists as alpine-zfsboot's boot-menu console (see that
+    # variable's own declaration comment for why these two used to be
+    # separate, sometimes-disagreeing settings). Only ttyS0/ttyAMA0 ever
+    # get a getty here - matching Alpine's own stock /etc/inittab, which
+    # only ships a commented-out line for those two - not extending
+    # getty support to ttyS1/ttyS2, a separate feature nobody has asked
+    # for yet.
+    local zfsboot_console_tty="${ALPINE_ZFSBOOT_CONSOLE%%,*}"
     cat > "${MOUNT_LOCATION}/chroot-install-script.sh" <<EOF
 #!/bin/sh
 set -eu
@@ -1990,7 +2006,7 @@ kernel_path="\$(find /lib/modules -mindepth 1 -maxdepth 1 -type d | head -n1)"
 kernel_version="\$(basename "\${kernel_path}")"
 mkinitfs -c /etc/mkinitfs/mkinitfs.conf "\${kernel_version}"
 
-if [ "${USE_SERIAL}" = "yes" ]; then
+if [ "${zfsboot_console_tty}" = "ttyS0" ] || [ "${zfsboot_console_tty}" = "ttyAMA0" ]; then
     case "${ARCH}" in
         x86_64)
             sed -i '/^[#]\\?ttyS0/s/^#//' /etc/inittab
@@ -2022,7 +2038,7 @@ run_chroot_install() {
 # `.previous` copy, and only once there's a prior install to back up).
 install_alpine_zfsboot_uefi() {
     zfsboot_config_args
-    alpine-zfsboot install "${SYSDRIVE}" \
+    "${ALPINE_ZFSBOOT_BIN}" install "${SYSDRIVE}" \
         --root "${MOUNT_LOCATION}" --firmware uefi --yes \
         --efi-file "${WORKDIR}/alpine-zfsboot.EFI" \
         "${ZFSBOOT_CONFIG_ARGS[@]}"
@@ -2072,12 +2088,99 @@ install_alpine_zfsboot_uefi() {
 # plain `: > config_file` truncate-in-place never had), this function's
 # only job is building the flags that tell it what to write.
 #
+# detect_console_pref - fills ALPINE_ZFSBOOT_CONSOLE from the REAL tty
+# this installer's own controlling terminal is attached to, unless the
+# operator/automation already set it explicitly (anything other than
+# "auto", the default - see that variable's own declaration comment).
+# Called once, early, from validate_environment() - before
+# write_chroot_install_script() needs the resolved value too (see that
+# function's own getty-enable logic), not just from zfsboot_config_args()
+# right before the --console flag is built.
+#
+# Real incident this closes: a Netcup VM installed over its VNC console
+# (tty0, UEFI) instead got alpine-zfsboot's own build-time
+# CONSOLE_CMDLINE default - "last console= wins" (see that comment in
+# alpine-zfsboot's build.sh), ttyS0 on x86_64. The operator watching
+# tty0 saw kernel boot messages, then nothing else ever again - not a
+# hang: the interactive menu was alive the whole time, just exec'd onto
+# ttyS0 alone (/init's own console-selection exec redirects ALL of its
+# own and menu.py's later output onto ACTIVE_TTY exclusively - every
+# OTHER listed console goes silent the moment userspace takes over).
+# Setting alpine-zfsboot.console=tty0 explicitly fixed it on that box.
+#
+# Detecting and persisting the console THIS INSTALL is actually running
+# on removes the guesswork: an install performed over serial gets
+# serial as the default, one performed over a VNC/local console gets
+# tty0 - whichever this process's own stdin is actually attached to
+# right now, not whatever CONSOLE_CMDLINE happened to bake in at build
+# time for a completely different machine/hypervisor. Still just a
+# default though, not a hard rule - a rescue session reached over
+# serial (QEMU/IPMI SOL) installing a machine that will itself boot on
+# tty0 (or vice versa) is a real, common shape explicit override exists
+# for: export ALPINE_ZFSBOOT_CONSOLE=tty0 (or any real value) before
+# running this script, and detection never runs at all.
+detect_console_pref() {
+    case "${ALPINE_ZFSBOOT_CONSOLE}" in
+        ""|auto) ;;
+        *) return 0 ;;  # operator already chose - never override that
+    esac
+    local t
+    # Prefers $ALPINE_ZFSBOOT_ACTIVE_TTY (exported by alpine-zfsboot's
+    # own /init, inherited into whatever shell it runs this installer
+    # from) over a live `tty` check - ACTIVE_TTY is set even when stdin
+    # is piped (e.g. `curl | bash` from inside alpine-zfsboot's own
+    # rescue shell - exactly where `tty` below would otherwise return
+    # nothing at all), and it's already the real, resolved answer
+    # select_console() itself computed, not an independent re-derivation
+    # that could disagree with it.
+    if [ -n "${ALPINE_ZFSBOOT_ACTIVE_TTY:-}" ]; then
+        ALPINE_ZFSBOOT_CONSOLE="$ALPINE_ZFSBOOT_ACTIVE_TTY"
+        return 0
+    fi
+    t="$(tty 2>/dev/null)" || { ALPINE_ZFSBOOT_CONSOLE=""; return 0; }  # no controlling terminal at all (piped stdin, etc.) - leave unset, not a guess
+    case "$t" in
+        /dev/tty[0-9]*)
+            # Linux VT: whichever /dev/ttyN this resolves to IS the
+            # currently active one - alpine-zfsboot.console=tty0 is the
+            # kernel's own "whichever VT is active" alias, matching
+            # CONSOLE_CMDLINE's own convention (build.sh), not a
+            # specific VT number.
+            ALPINE_ZFSBOOT_CONSOLE="tty0"
+            ;;
+        /dev/ttyS0|/dev/ttyS1|/dev/ttyS2|/dev/ttyAMA0)
+            # alpine-zfsboot's own /init hardcodes its candidate list to
+            # EXACTLY tty0/ttyS0/ttyS1/ttyS2/ttyAMA0 (select_console(),
+            # init/init) - anything else (ttyS3 and up, ttyAMA1 and up,
+            # ttyUSB*, a USB-serial adapter's own node, etc.) is
+            # silently never selected as ACTIVE_TTY, no matter what
+            # alpine-zfsboot.console= says. This installer running on a
+            # rescue environment reached via alpine-zfsboot's own boot
+            # chain can never observe an out-of-range
+            # $ALPINE_ZFSBOOT_ACTIVE_TTY (it's bound by the exact same
+            # candidate list at the source), but a plain `tty` on some
+            # OTHER rescue environment's own serial setup could
+            # legitimately report one - persisting it here would be
+            # exactly the "persisted something the boot-time candidate
+            # list silently ignores" shape this whole effort exists to
+            # close, just moved one step earlier. Matched explicitly
+            # against the real candidate set, not a glob.
+            ALPINE_ZFSBOOT_CONSOLE="${t#/dev/}"
+            ;;
+        *)
+            ALPINE_ZFSBOOT_CONSOLE=""  # a pty (e.g. SSH into the rescue env itself), an out-of-range serial device, or anything else with no real console= equivalent - leave unset, not a guess
+            ;;
+    esac
+}
+
 # ALPINE_ZFSBOOT_SSH_KEY may hold several newline-separated lines (see its
 # own declaration comment/validate_environment()'s loop) - a single array
 # element preserves that exactly, same as the old printf '%s\n' did.
 zfsboot_config_args() {
+    # detect_console_pref already ran, early, in validate_environment() -
+    # ALPINE_ZFSBOOT_CONSOLE is already fully resolved by this point.
     ZFSBOOT_CONFIG_ARGS=()
     [ -n "${ALPINE_ZFSBOOT_SSH_KEY}" ] && ZFSBOOT_CONFIG_ARGS+=(--ssh-key "${ALPINE_ZFSBOOT_SSH_KEY}")
+    [ -n "${ALPINE_ZFSBOOT_CONSOLE}" ] && ZFSBOOT_CONFIG_ARGS+=(--console "${ALPINE_ZFSBOOT_CONSOLE}")
     [ -n "${ALPINE_ZFSBOOT_NET}" ] && ZFSBOOT_CONFIG_ARGS+=(--net "${ALPINE_ZFSBOOT_NET}")
     [ -n "${ALPINE_ZFSBOOT_IPV4}" ] && ZFSBOOT_CONFIG_ARGS+=(--ipv4 "${ALPINE_ZFSBOOT_IPV4}")
     [ -n "${ALPINE_ZFSBOOT_IPV4_ADDRESS}" ] && ZFSBOOT_CONFIG_ARGS+=(--ipv4-address "${ALPINE_ZFSBOOT_IPV4_ADDRESS}")
@@ -2121,7 +2224,7 @@ install_alpine_zfsboot_bios() {
     # function returns. One authoritative implementation of this on-disk
     # ABI, not a second one duplicated here in shell.
     zfsboot_config_args
-    alpine-zfsboot install "${SYSDRIVE}" \
+    "${ALPINE_ZFSBOOT_BIN}" install "${SYSDRIVE}" \
         --root "${MOUNT_LOCATION}" --firmware bios --yes \
         --stage1-file "${WORKDIR}/stage1.bin" \
         --stage2-file "${WORKDIR}/stage2.bin" \
@@ -2192,7 +2295,7 @@ verify_installation() {
     # in this script, which is exactly the duplication this whole PR
     # exists to remove.
     if [ "${USE_UEFI}" = "yes" ]; then
-        alpine-zfsboot verify --root "${MOUNT_LOCATION}" --firmware uefi \
+        "${ALPINE_ZFSBOOT_BIN}" verify --root "${MOUNT_LOCATION}" --firmware uefi \
             --efi-file "${WORKDIR}/alpine-zfsboot.EFI" ||
             die "alpine-zfsboot verify reported a problem with the installed UEFI loader (see its own output just above)."
     else
@@ -2211,7 +2314,7 @@ verify_installation() {
         # for like. Safe to remove once #9 ships and `verify --stage1-file`
         # accepts a raw 512-byte sector the same way `install` does.
         head -c 440 "${WORKDIR}/stage1.bin" > "${WORKDIR}/stage1-code.bin"
-        alpine-zfsboot verify --root "${MOUNT_LOCATION}" --firmware bios \
+        "${ALPINE_ZFSBOOT_BIN}" verify --root "${MOUNT_LOCATION}" --firmware bios \
             --stage1-file "${WORKDIR}/stage1-code.bin" \
             --stage2-file "${WORKDIR}/stage2.bin" \
             --kernel-file "${WORKDIR}/bios-kernel" \
