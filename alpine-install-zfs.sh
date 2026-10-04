@@ -277,7 +277,15 @@ ALPINE_ZFSBOOT_SSH_ALLOW="${ALPINE_ZFSBOOT_SSH_ALLOW:-}"
 # (or vice versa) - auto-detection sees only the RESCUE session's own
 # console, which can genuinely differ from the target's real one. See
 # detect_console_pref()'s own comment for the Netcup incident that
-# motivated auto-detection in the first place.
+# motivated auto-detection in the first place. "none" is an explicit "do
+# not persist a console and enable no serial getty" (it also skips the
+# `install --console` capability check). When auto finds nothing - e.g. an
+# install run over SSH with no known console= on the rescue kernel's
+# command line - it logs a WARNING and persists nothing. "auto" only ever
+# learns the console NAME, never its line settings (alpine-zfsboot's /init
+# exports just the name), so a machine whose serial line is not 115200n8
+# needs an explicit value such as "ttyS1,9600n8"; the settings are carried
+# through --console and persisted verbatim.
 ALPINE_ZFSBOOT_CONSOLE="${ALPINE_ZFSBOOT_CONSOLE:-auto}"
 
 # The alpine-zfsboot CLI this script drives (install/verify). Empty (the
@@ -880,15 +888,17 @@ EOF
     # no real benefit over just asking the binary what it can do.
     "${ALPINE_ZFSBOOT_BIN}" install --help >/dev/null 2>&1 &&
         "${ALPINE_ZFSBOOT_BIN}" verify --help >/dev/null 2>&1 ||
-        die "alpine-zfsboot on this host ($("${ALPINE_ZFSBOOT_BIN}" --version 2>/dev/null || echo "unknown version")) has no install/verify subcommands - it needs 0.2.0 or newer (apk upgrade alpine-zfsboot)."
+        die "${ALPINE_ZFSBOOT_BIN} ($("${ALPINE_ZFSBOOT_BIN}" --version 2>/dev/null || echo "unknown version")) has no install/verify subcommands - it needs 0.2.0 or newer. Point ALPINE_ZFSBOOT_BIN at a newer CLI (e.g. ALPINE_ZFSBOOT_BIN=/usr/bin/alpine-zfsboot after apk upgrade alpine-zfsboot)."
 
     # `install --console` only exists in alpine-zfsboot releases newer than
     # 0.3.0. Silently dropping the flag would leave the console unpersisted
     # - exactly the lockout the console setting exists to prevent - so
     # refuse up front, before any disk is touched.
+    # (grep without -q: -q exits on the first match, and a CLI still writing
+    # help text would take SIGPIPE, which pipefail reports as "no --console".)
     if [ -n "${ALPINE_ZFSBOOT_CONSOLE}" ] &&
-        ! "${ALPINE_ZFSBOOT_BIN}" install --help 2>&1 | grep -q -- '--console'; then
-        die "alpine-zfsboot on this host ($("${ALPINE_ZFSBOOT_BIN}" --version 2>/dev/null || echo "unknown version")) has no 'install --console' - needs a release newer than 0.3.0 (apk upgrade alpine-zfsboot)."
+        ! "${ALPINE_ZFSBOOT_BIN}" install --help 2>&1 | grep -- '--console' >/dev/null; then
+        die "${ALPINE_ZFSBOOT_BIN} ($("${ALPINE_ZFSBOOT_BIN}" --version 2>/dev/null || echo "unknown version")) has no 'install --console' - needs a release newer than 0.3.0. Point ALPINE_ZFSBOOT_BIN at a newer CLI (e.g. ALPINE_ZFSBOOT_BIN=/usr/bin/alpine-zfsboot after apk upgrade alpine-zfsboot), or set ALPINE_ZFSBOOT_CONSOLE=none to skip persisting a console."
     fi
 
     getent hosts dl-cdn.alpinelinux.org >/dev/null 2>&1 ||
@@ -1683,8 +1693,14 @@ write_fstab() {
     fi
     cat >> "${MOUNT_LOCATION}/etc/fstab" <<'EOF'
 proc /proc proc defaults,hidepid=2 0 0
-tmpfs /tmp tmpfs defaults,nosuid,nodev,size=1G 0 0
 EOF
+    # /tmp is a tmpfs capped at the SMALLER of 1 GiB and the kernel's own
+    # default (half of RAM). A fixed size=1G would RAISE the cap on a host
+    # with less than 2 GiB of RAM (all of RAM on a 1 GiB VPS), the opposite
+    # of the point. The rescue system runs on the target hardware, so its
+    # MemTotal is the right input.
+    tmp_size_k="$(awk '/^MemTotal:/{h=int($2/2); print (h < 1048576 ? h : 1048576)}' /proc/meminfo 2>/dev/null)"
+    printf 'tmpfs /tmp tmpfs defaults,nosuid,nodev,size=%sk 0 0\n' "${tmp_size_k:-1048576}" >> "${MOUNT_LOCATION}/etc/fstab"
 }
 
 install_acpi_handler() {
@@ -1734,10 +1750,10 @@ write_chroot_install_script() {
     # persists as alpine-zfsboot's boot-menu console (see that
     # variable's own declaration comment for why these two used to be
     # separate, sometimes-disagreeing settings). Only ttyS0/ttyAMA0 ever
-    # get a getty here - matching Alpine's own stock /etc/inittab, which
-    # only ships a commented-out line for those two - not extending
-    # getty support to ttyS1/ttyS2, a separate feature nobody has asked
-    # for yet.
+    # get a getty here. Alpine's stock /etc/inittab only has a
+    # commented-out line for ttyS0 (none for ttyAMA0), so the chroot
+    # script uncomments or appends as needed. Not extending getty
+    # support to ttyS1/ttyS2, a separate feature nobody has asked for yet.
     local zfsboot_console_tty="${ALPINE_ZFSBOOT_CONSOLE%%,*}"
     cat > "${MOUNT_LOCATION}/chroot-install-script.sh" <<EOF
 #!/bin/sh
@@ -2007,14 +2023,14 @@ kernel_version="\$(basename "\${kernel_path}")"
 mkinitfs -c /etc/mkinitfs/mkinitfs.conf "\${kernel_version}"
 
 if [ "${zfsboot_console_tty}" = "ttyS0" ] || [ "${zfsboot_console_tty}" = "ttyAMA0" ]; then
-    case "${ARCH}" in
-        x86_64)
-            sed -i '/^[#]\\?ttyS0/s/^#//' /etc/inittab
-            ;;
-        aarch64)
-            sed -i '/^[#]\\?ttyAMA0/s/^#//' /etc/inittab
-            ;;
-    esac
+    # Keyed on the console NAME, not the arch. Alpine's stock inittab only
+    # carries a commented ttyS0 line (no ttyAMA0 line on any arch), so
+    # uncomment it when it exists and append the line when it does not.
+    if grep -q "^#\\?${zfsboot_console_tty}:" /etc/inittab; then
+        sed -i "s/^#\\(${zfsboot_console_tty}:\\)/\\1/" /etc/inittab
+    else
+        echo "${zfsboot_console_tty}::respawn:/sbin/getty -L 115200 ${zfsboot_console_tty} vt100" >> /etc/inittab
+    fi
 fi
 
 rm -f /chroot-install-script.sh
@@ -2119,8 +2135,34 @@ install_alpine_zfsboot_uefi() {
 # tty0 (or vice versa) is a real, common shape explicit override exists
 # for: export ALPINE_ZFSBOOT_CONSOLE=tty0 (or any real value) before
 # running this script, and detection never runs at all.
+# The last known console= on this rescue system's own kernel command line
+# (kernel convention: the last one wins), e.g. "ttyS0,115200n8". Empty if
+# there is none or it is not a console alpine-zfsboot can select. Used when
+# there is no usable live tty (an install run over SSH).
+console_from_cmdline() {
+    local tok c=""
+    [ -r /proc/cmdline ] || return 0
+    for tok in $(cat /proc/cmdline); do
+        case "${tok}" in
+            console=tty0|console=ttyS[012]|console=ttyS[012],*|console=ttyAMA0|console=ttyAMA0,*)
+                c="${tok#console=}"
+                ;;
+        esac
+    done
+    if [[ "${c}" =~ ^(tty0|ttyS[012]|ttyAMA0)(,[0-9]+[neo]?[5-8]?r?)?$ ]]; then
+        printf '%s\n' "${c}"
+    fi
+}
+
 detect_console_pref() {
     case "${ALPINE_ZFSBOOT_CONSOLE}" in
+        none)
+            # Explicit "do not persist a console" (also skips the
+            # `install --console` capability check).
+            log "ALPINE_ZFSBOOT_CONSOLE=none - no console will be persisted and no serial getty enabled"
+            ALPINE_ZFSBOOT_CONSOLE=""
+            return 0
+            ;;
         ""|auto) ;;
         *) return 0 ;;  # operator already chose - never override that
     esac
@@ -2137,7 +2179,7 @@ detect_console_pref() {
         ALPINE_ZFSBOOT_CONSOLE="$ALPINE_ZFSBOOT_ACTIVE_TTY"
         return 0
     fi
-    t="$(tty 2>/dev/null)" || { ALPINE_ZFSBOOT_CONSOLE=""; return 0; }  # no controlling terminal at all (piped stdin, etc.) - leave unset, not a guess
+    t="$(tty 2>/dev/null)" || t=""  # no controlling terminal at all (piped stdin, etc.)
     case "$t" in
         /dev/tty[0-9]*)
             # Linux VT: whichever /dev/ttyN this resolves to IS the
@@ -2167,9 +2209,21 @@ detect_console_pref() {
             ALPINE_ZFSBOOT_CONSOLE="${t#/dev/}"
             ;;
         *)
-            ALPINE_ZFSBOOT_CONSOLE=""  # a pty (e.g. SSH into the rescue env itself), an out-of-range serial device, or anything else with no real console= equivalent - leave unset, not a guess
+            ALPINE_ZFSBOOT_CONSOLE=""  # a pty (e.g. SSH into the rescue env itself), an out-of-range serial device, or anything else with no real console= equivalent
             ;;
     esac
+
+    # No usable live tty (typically an install run over SSH, where
+    # alpine-zfsboot's ACTIVE_TTY never arrives: dropbear clears the
+    # environment): fall back to the rescue system's own kernel console=,
+    # as the old USE_SERIAL detection did.
+    if [ -z "${ALPINE_ZFSBOOT_CONSOLE}" ]; then
+        ALPINE_ZFSBOOT_CONSOLE="$(console_from_cmdline)"
+    fi
+
+    if [ -z "${ALPINE_ZFSBOOT_CONSOLE}" ]; then
+        log "WARNING: ALPINE_ZFSBOOT_CONSOLE=auto could not detect a console (tty: '${t:-none}', no known console= on the kernel command line). Nothing will be persisted and the installed system gets no serial getty. Set ALPINE_ZFSBOOT_CONSOLE explicitly (e.g. ttyS0,115200n8) if this machine is reached over serial, or ALPINE_ZFSBOOT_CONSOLE=none to silence this."
+    fi
 }
 
 # ALPINE_ZFSBOOT_SSH_KEY may hold several newline-separated lines (see its

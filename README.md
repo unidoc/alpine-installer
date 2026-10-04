@@ -14,8 +14,11 @@ away from undone, which a plain ext4 root just can't offer. Reach for
 non-standard partition layout, or want to avoid ZFS's operational model
 (licensing questions, unfamiliarity, a target that doesn't suit it).
 
-`alpine-install-zfs.sh` needs the `alpine-zfsboot` CLI (0.2.0 or newer; a release newer than 0.3.0 for the console option, `install --console`)
-already on the rescue host's own `PATH` first - see "The `alpine-zfsboot`
+`alpine-install-zfs.sh` needs the `alpine-zfsboot` CLI, a release newer than 0.3.0
+(the default `ALPINE_ZFSBOOT_CONSOLE=auto` uses `install --console`; set
+`ALPINE_ZFSBOOT_CONSOLE=none` to run with 0.2.0 or newer without it).
+It uses `/boot/alpine-zfsboot` (the binary shipped inside the image you
+booted) if present, otherwise the one on the rescue host's own `PATH` - see "The `alpine-zfsboot`
 CLI itself" below for why it's a prerequisite rather than something this
 script fetches. On a stock rescue image that isn't already
 alpine-zfsboot's own rescue environment (which bundles it):
@@ -150,7 +153,7 @@ artifact overrides.
 | `DISK_LAYOUT` | `gpt` | `gpt`/`msdos` - legacy BIOS mode's disk-partitioning scheme (`USE_UEFI=no` only; there is no msdos+UEFI path, UEFI firmware needs GPT+ESP). Both are real, first-class layouts - alpine-zfsboot's own boot code auto-detects which is on disk at boot time |
 | `ENCRYPT_ZROOT` | `no` | `yes` makes the ZFS `ROOT` container itself the encryption root (`aes-256-gcm`, one passphrase) - every boot environment, current and future, inherits it automatically. Requires `ZROOT_PASSPHRASE` |
 | `ZROOT_PASSPHRASE` | *(empty)* | Required when `ENCRYPT_ZROOT=yes`. Never put this on a command line - export it |
-| `ALPINE_ZFSBOOT_CONSOLE` | `auto` | The one source of truth for console output - both alpine-zfsboot's own persisted boot-menu console (`alpine-zfsboot.console=`) AND whether the installed system gets a getty on `ttyS0`/`ttyAMA0`. `auto` detects the console THIS INSTALL is actually running on (preferring `$ALPINE_ZFSBOOT_ACTIVE_TTY`, exported by alpine-zfsboot's own `/init`, over a live `tty` check). Set explicitly (e.g. `tty0` or `ttyS0,115200n8`) when the rescue session's own console differs from the target machine's real one - installing over serial for a machine that itself boots on tty0 (or vice versa) is the common case this covers; detection never overrides an explicit value. Valid values are `tty0`, `ttyS0`-`ttyS2` and `ttyAMA0`, optionally with `,<baud>[n\|e\|o][5-8][r]`; anything else is rejected before any disk is touched |
+| `ALPINE_ZFSBOOT_CONSOLE` | `auto` | The one source of truth for console output - both alpine-zfsboot's own persisted boot-menu console (`alpine-zfsboot.console=`) AND whether the installed system gets a getty on `ttyS0`/`ttyAMA0`. `auto` detects the console THIS INSTALL is actually running on: `$ALPINE_ZFSBOOT_ACTIVE_TTY` (exported by alpine-zfsboot's `/init`, local console only - it does not reach an SSH session), then a live `tty`, then the rescue kernel's own last `console=`. If none of these finds anything (e.g. an install over SSH on a rescue image with no serial `console=`), a WARNING is logged and nothing is persisted. `auto` only learns the console *name*, never its line settings (alpine-zfsboot's `/init` exports just the name), so a machine whose serial line is not 115200n8 must be given an explicit value, e.g. `ALPINE_ZFSBOOT_CONSOLE="ttyS1,9600n8"` - the settings travel with the value and are persisted verbatim. `none` explicitly skips persisting a console (and the `install --console` requirement). Set explicitly (e.g. `tty0` or `ttyS0,115200n8`) when the rescue session's own console differs from the target machine's real one - installing over serial for a machine that itself boots on tty0 (or vice versa) is the common case this covers; detection never overrides an explicit value. Valid values are `tty0`, `ttyS0`-`ttyS2` and `ttyAMA0`, optionally with `,<baud>[n\|e\|o][5-8][r]`; anything else is rejected before any disk is touched |
 | `ALPINE_ZFSBOOT_BIN` | *(empty)* | The alpine-zfsboot CLI to drive. Empty means `/boot/alpine-zfsboot` if present (the binary that ships inside the image you booted - the one that should install the system), else the one on `PATH`. It is never installed automatically; set this to use a specific binary. An explicit value is never replaced |
 
 **Per-machine rescue SSH/network settings** - available on every layout

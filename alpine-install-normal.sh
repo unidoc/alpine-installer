@@ -305,8 +305,11 @@ detect_console_output() {
     # script has no GRUB/inittab wiring for (e.g. ttyS1/ttyS2 -
     # alpine-zfsboot can listen on those, this script only ever supports
     # one serial device per arch).
-    case "${ALPINE_ZFSBOOT_ACTIVE_TTY:-}" in
-        tty0|ttyS0|ttyAMA0)
+    # Matched per arch: ttyS0 is not a valid serial console on aarch64 and
+    # ttyAMA0 is not one on x86_64, and the validation below dies on a
+    # mismatch the operator never asked for.
+    case "${ARCH}:${ALPINE_ZFSBOOT_ACTIVE_TTY:-}" in
+        x86_64:tty0|x86_64:ttyS0|aarch64:tty0|aarch64:ttyAMA0)
             CONSOLE_OUTPUT="${ALPINE_ZFSBOOT_ACTIVE_TTY}"
             return 0
             ;;
@@ -755,8 +758,14 @@ EOF
     fi
     cat >> "${MOUNT_LOCATION}/etc/fstab" <<'EOF'
 proc /proc proc defaults,hidepid=2 0 0
-tmpfs /tmp tmpfs defaults,nosuid,nodev,size=1G 0 0
 EOF
+    # /tmp is a tmpfs capped at the SMALLER of 1 GiB and the kernel's own
+    # default (half of RAM). A fixed size=1G would RAISE the cap on a host
+    # with less than 2 GiB of RAM (all of RAM on a 1 GiB VPS), the opposite
+    # of the point. The rescue system runs on the target hardware, so its
+    # MemTotal is the right input.
+    tmp_size_k="$(awk '/^MemTotal:/{h=int($2/2); print (h < 1048576 ? h : 1048576)}' /proc/meminfo 2>/dev/null)"
+    printf 'tmpfs /tmp tmpfs defaults,nosuid,nodev,size=%sk 0 0\n' "${tmp_size_k:-1048576}" >> "${MOUNT_LOCATION}/etc/fstab"
 
     if [ "${USE_UEFI}" = "yes" ]; then
         log "Formatting EFI System Partition"
@@ -952,7 +961,13 @@ chmod 0644 /etc/ssh/sshd_config.d/local.conf
 getent passwd sshd >/dev/null || adduser -h / -s /sbin/nologin -S sshd
 
 if [ "${CONSOLE_OUTPUT}" = "ttyS0" ] || [ "${CONSOLE_OUTPUT}" = "ttyAMA0" ]; then
-    sed -i "/^[#]\\?${CONSOLE_OUTPUT}/s/^#//" /etc/inittab
+    # Alpine's stock inittab only carries a commented ttyS0 line (none for
+    # ttyAMA0 on any arch): uncomment it when it exists, append otherwise.
+    if grep -q "^#\\?${CONSOLE_OUTPUT}:" /etc/inittab; then
+        sed -i "s/^#\\(${CONSOLE_OUTPUT}:\\)/\\1/" /etc/inittab
+    else
+        echo "${CONSOLE_OUTPUT}::respawn:/sbin/getty -L 115200 ${CONSOLE_OUTPUT} vt100" >> /etc/inittab
+    fi
 fi
 
 rm -f /chroot-install-script.sh
