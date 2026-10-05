@@ -1914,10 +1914,11 @@ echo button >> /etc/modules
 # installed system, while the running kernel's own module directory is
 # still intact, so it is already resident by the time any later
 # \`apk upgrade\` empties that directory out from under the running
-# kernel. UEFI only - legacy BIOS mode (GRUB installs straight to the
-# disk's own boot sector) has no vfat filesystem anywhere on the disk
-# at all.
-if [ "${USE_UEFI}" != "no" ]; then
+# kernel. BOTH firmware modes: alpine-zfsboot's BIOS and UEFI paths share
+# the same FAT ESP, mounted at /boot/efi on every install (see the fstab
+# line written in format_boot_partition), so a legacy-BIOS install needs
+# vfat just the same.
+if true; then
     echo vfat >> /etc/modules
     # FAT loads its codepage AND iocharset NLS tables lazily, inside
     # the mount() call itself (fat_fill_super -> load_nls("cp437")
